@@ -117,26 +117,100 @@ def calculate_stakes(odds_a: float, odds_b: float, total_stake: float) -> tuple:
 def calculate_guaranteed_profit(odds_a: float, odds_b: float, stake_a: float, stake_b: float) -> float:
     """
     Calculate the guaranteed profit from an arbitrage bet.
-    
+
     Args:
         odds_a: Decimal odds for outcome A
         odds_b: Decimal odds for outcome B
         stake_a: Amount bet on outcome A
         stake_b: Amount bet on outcome B
-    
+
     Returns:
         Guaranteed profit amount
     """
     # Calculate potential returns from each outcome
     return_a = stake_a * odds_a
     return_b = stake_b * odds_b
-    
+
     # Both should be equal (or very close) in a proper arbitrage
     # Return profit (return minus total investment)
     total_investment = stake_a + stake_b
     guaranteed_return = min(return_a, return_b)  # Use minimum for safety
-    
+
     return guaranteed_return - total_investment
+
+
+def verify_stakes_after_rounding(odds_a: float, odds_b: float, stake_a: float, stake_b: float) -> tuple:
+    """
+    Verify that rounded stakes still produce valid arbitrage.
+    If rounding breaks the arbitrage, adjust stakes to restore it.
+
+    Args:
+        odds_a: Decimal odds for outcome A
+        odds_b: Decimal odds for outcome B
+        stake_a: Rounded stake for outcome A
+        stake_b: Rounded stake for outcome B
+
+    Returns:
+        Tuple of (adjusted_stake_a, adjusted_stake_b, is_valid)
+        is_valid: True if arbitrage is preserved after rounding (within 1 cent tolerance)
+    """
+    # Calculate potential returns
+    return_a = stake_a * odds_a
+    return_b = stake_b * odds_b
+
+    # Check if returns are equal within 1 cent tolerance
+    return_diff = abs(return_a - return_b)
+
+    if return_diff <= 0.01:
+        # Arbitrage is preserved
+        return (stake_a, stake_b, True)
+
+    # If returns don't match, adjust the larger stake down to equalize
+    if return_a > return_b:
+        # Reduce stake_a to match return_b
+        adjusted_stake_a = return_b / odds_a
+        adjusted_stake_a = round(adjusted_stake_a, 2)
+        return (adjusted_stake_a, stake_b, True)
+    else:
+        # Reduce stake_b to match return_a
+        adjusted_stake_b = return_a / odds_b
+        adjusted_stake_b = round(adjusted_stake_b, 2)
+        return (stake_a, adjusted_stake_b, True)
+
+
+def calculate_stakes_with_validation(odds_a: float, odds_b: float, total_stake: float) -> Union[tuple, None]:
+    """
+    Calculate optimal stakes and validate that arbitrage survives rounding.
+
+    Args:
+        odds_a: Decimal odds for outcome A
+        odds_b: Decimal odds for outcome B
+        total_stake: Total investment amount
+
+    Returns:
+        Tuple of (stake_a, stake_b) if valid arbitrage after rounding, None otherwise
+    """
+    # Calculate ideal stakes
+    denominator = (1 / odds_a) + (1 / odds_b)
+    stake_a_ideal = total_stake * (1 / odds_a) / denominator
+    stake_b_ideal = total_stake * (1 / odds_b) / denominator
+
+    # Round to nearest cent
+    stake_a_rounded = round(stake_a_ideal, 2)
+    stake_b_rounded = round(stake_b_ideal, 2)
+
+    # Adjust so total matches exactly
+    stake_b_rounded = round(total_stake - stake_a_rounded, 2)
+
+    # Verify arbitrage is preserved
+    stake_a_final, stake_b_final, is_valid = verify_stakes_after_rounding(
+        odds_a, odds_b, stake_a_rounded, stake_b_rounded
+    )
+
+    if is_valid:
+        return (stake_a_final, stake_b_final)
+    else:
+        return None
 
 
 def calculate_three_way_arbitrage(odds_a: float, odds_draw: float, odds_b: float) -> float:
@@ -216,10 +290,10 @@ def calculate_three_way_profit(odds_a: float, odds_draw: float, odds_b: float,
 def get_sport_display_name(sport_key: str) -> str:
     """
     Convert sport key to display-friendly name.
-    
+
     Args:
         sport_key: API sport key (e.g., 'mma_mixed_martial_arts')
-    
+
     Returns:
         Display name (e.g., 'MMA')
     """
@@ -236,4 +310,88 @@ def get_sport_display_name(sport_key: str) -> str:
         'icehockey_sweden_hockey_league': 'SHL (Sweden)',
     }
     return sport_names.get(sport_key, sport_key.replace('_', ' ').title())
+
+
+def normalize_team_name(name: str) -> str:
+    """
+    Normalize team/player name for comparison across bookmakers.
+
+    Args:
+        name: Team/player name from API
+
+    Returns:
+        Normalized name (lowercase, stripped)
+    """
+    if not name:
+        return ""
+
+    # Convert to lowercase and strip whitespace
+    normalized = name.lower().strip()
+
+    # Remove common prefixes/suffixes that vary by bookmaker
+    normalized = normalized.replace('fc ', '').replace(' fc', '')
+    normalized = normalized.replace('team ', '').replace(' team', '')
+    normalized = normalized.replace('united', 'utd')
+
+    return normalized
+
+
+def identify_outcome_type(outcome_name: str, home_team: str, away_team: str) -> str:
+    """
+    Identify if outcome is HOME, AWAY, DRAW, or OTHER.
+
+    Args:
+        outcome_name: The outcome name from the API
+        home_team: Home team name
+        away_team: Away team name
+
+    Returns:
+        One of: 'HOME', 'AWAY', 'DRAW', 'OTHER'
+    """
+    if not outcome_name:
+        return 'OTHER'
+
+    outcome_lower = outcome_name.lower()
+    home_normalized = normalize_team_name(home_team)
+    away_normalized = normalize_team_name(away_team)
+
+    # Check for draw explicitly
+    if 'draw' in outcome_lower or 'tie' in outcome_lower:
+        return 'DRAW'
+
+    # Check for home team
+    if home_normalized and home_normalized in outcome_lower:
+        return 'HOME'
+    if 'home' in outcome_lower:
+        return 'HOME'
+
+    # Check for away team
+    if away_normalized and away_normalized in outcome_lower:
+        return 'AWAY'
+    if 'away' in outcome_lower or 'road' in outcome_lower:
+        return 'AWAY'
+
+    # If we can't identify it, return the original name
+    return 'OTHER'
+
+
+def create_canonical_outcome_key(outcome_type: str, point: float = None, market_type: str = 'h2h') -> str:
+    """
+    Create a canonical outcome key for consistent matching.
+
+    Args:
+        outcome_type: One of HOME, AWAY, DRAW, or specific name
+        point: Point value for spreads/totals (e.g., 3.5 for -3.5)
+        market_type: Type of market (h2h, spreads, totals)
+
+    Returns:
+        Canonical key (e.g., "HOME", "AWAY_-3.5", "OVER_2.5")
+    """
+    if market_type == 'h2h' or point is None:
+        return outcome_type
+    elif outcome_type in ['HOME', 'AWAY']:
+        return f"{outcome_type}_{point:+.1f}".replace('+', '')
+    else:
+        # For totals (OVER/UNDER)
+        return f"{outcome_type}_{point:.1f}"
 

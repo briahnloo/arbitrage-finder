@@ -21,7 +21,12 @@ from utils import (
     calculate_three_way_arbitrage,
     calculate_three_way_stakes,
     calculate_three_way_profit,
-    get_sport_display_name
+    get_sport_display_name,
+    normalize_team_name,
+    identify_outcome_type,
+    create_canonical_outcome_key,
+    verify_stakes_after_rounding,
+    calculate_stakes_with_validation
 )
 
 # Import database if logging enabled
@@ -87,141 +92,326 @@ class ArbitrageFinder:
     
     def process_odds(self, odds_data: List[Dict], sport: str) -> List[Dict]:
         """
-        Process odds data to find the best odds for each match outcome across all markets.
-        
+        Process odds data with improved outcome normalization and top 3 odds tracking.
+
         Args:
             odds_data: List of match data from API
             sport: Sport key for display purposes
-        
+
         Returns:
-            List of processed match dictionaries with best odds per market type
+            List of processed match dictionaries with top odds per market type
         """
         processed_matches = []
-        
+
         for match in odds_data:
             if not match.get('bookmakers'):
                 continue
-            
+
             # Extract match info
             home_team = match.get('home_team', 'Unknown')
             away_team = match.get('away_team', 'Unknown')
             commence_time = match.get('commence_time', '')
-            
-            # Group odds by market type
-            markets_odds = {}  # {market_key: {outcome_key: {'odds': x, 'bookmaker': y}}}
-            
+
+            # Group odds by market type and normalized outcome
+            # Format: {market_key: {canonical_outcome_key: [{'odds': x, 'bookmaker': y}, ...]}}
+            markets_odds = {}
+
             for bookmaker in match['bookmakers']:
                 bookmaker_name = bookmaker.get('title', 'Unknown')
-                
+
                 for market in bookmaker.get('markets', []):
                     market_key = market.get('key')
                     if not market_key:
                         continue
-                    
+
                     # Initialize market if not exists
                     if market_key not in markets_odds:
                         markets_odds[market_key] = {}
-                    
+
                     for outcome in market.get('outcomes', []):
-                        # For h2h, use player name; for totals/spreads, use name+point
-                        if market_key == 'h2h':
-                            outcome_key = outcome.get('name')
-                        elif market_key == 'totals':
-                            # Over/Under with point value
-                            outcome_key = f"{outcome.get('name')} {outcome.get('point', '')}"
-                        elif market_key == 'spreads':
-                            # Team with spread point
-                            outcome_key = f"{outcome.get('name')} {outcome.get('point', '')}"
-                        else:
-                            outcome_key = outcome.get('name')
-                        
                         odds = outcome.get('price')
-                        
-                        if outcome_key and odds:
-                            # Update if this is the best odds for this outcome
-                            if outcome_key not in markets_odds[market_key] or odds > markets_odds[market_key][outcome_key]['odds']:
-                                markets_odds[market_key][outcome_key] = {
-                                    'odds': odds,
-                                    'bookmaker': bookmaker_name
-                                }
-            
+
+                        # Skip invalid odds
+                        if not odds or odds < 1.0 or odds > 1000:
+                            continue
+
+                        # Create canonical outcome key
+                        if market_key == 'h2h':
+                            # For h2h, identify if HOME/AWAY/DRAW
+                            outcome_type = identify_outcome_type(outcome.get('name'), home_team, away_team)
+                            canonical_key = create_canonical_outcome_key(outcome_type, point=None, market_type='h2h')
+                        elif market_key == 'spreads':
+                            # For spreads, identify team then add point
+                            outcome_type = identify_outcome_type(outcome.get('name'), home_team, away_team)
+                            point = outcome.get('point')
+                            canonical_key = create_canonical_outcome_key(outcome_type, point=point, market_type='spreads')
+                        elif market_key == 'totals':
+                            # For totals, use OVER/UNDER
+                            outcome_name = outcome.get('name', '').upper()
+                            outcome_type = 'OVER' if 'OVER' in outcome_name else 'UNDER'
+                            point = outcome.get('point')
+                            canonical_key = create_canonical_outcome_key(outcome_type, point=point, market_type='totals')
+                        else:
+                            # Unknown market type, use raw name
+                            canonical_key = outcome.get('name', 'UNKNOWN')
+
+                        # Store odds (keep top 3 for each outcome)
+                        if canonical_key not in markets_odds[market_key]:
+                            markets_odds[market_key][canonical_key] = []
+
+                        # Add this odds option
+                        markets_odds[market_key][canonical_key].append({
+                            'odds': odds,
+                            'bookmaker': bookmaker_name,
+                            'raw_name': outcome.get('name')  # Keep for reference
+                        })
+
+            # Sort each outcome's odds list by odds (best first)
+            for market_key in markets_odds:
+                for canonical_key in markets_odds[market_key]:
+                    markets_odds[market_key][canonical_key].sort(
+                        key=lambda x: x['odds'],
+                        reverse=True
+                    )
+
             # Process each market type separately
-            for market_key, best_odds in markets_odds.items():
-                outcomes = list(best_odds.keys())
-                
+            for market_key, outcome_odds in markets_odds.items():
+                # Filter to only outcomes with odds available
+                outcome_keys = list(outcome_odds.keys())
+
                 # Handle 2-way markets (combat sports, totals, spreads)
-                if len(best_odds) == 2:
-                    processed_matches.append({
-                        'sport': sport,
-                        'market': market_key,
-                        'num_outcomes': 2,
-                        'player_a': outcomes[0],
-                        'player_b': outcomes[1],
-                        'odds_a': best_odds[outcomes[0]]['odds'],
-                        'odds_b': best_odds[outcomes[1]]['odds'],
-                        'bookmaker_a': best_odds[outcomes[0]]['bookmaker'],
-                        'bookmaker_b': best_odds[outcomes[1]]['bookmaker'],
-                        'commence_time': commence_time,
-                        'event_name': f"{home_team} vs {away_team}"
-                    })
-                
+                if len(outcome_keys) == 2:
+                    outcome_a_key = outcome_keys[0]
+                    outcome_b_key = outcome_keys[1]
+
+                    outcome_a_list = outcome_odds[outcome_a_key]
+                    outcome_b_list = outcome_odds[outcome_b_key]
+
+                    # Generate opportunities for top 3 combinations
+                    for i, odds_a_option in enumerate(outcome_a_list[:3]):
+                        for j, odds_b_option in enumerate(outcome_b_list[:3]):
+                            processed_matches.append({
+                                'sport': sport,
+                                'market': market_key,
+                                'num_outcomes': 2,
+                                'player_a': outcome_a_key,
+                                'player_b': outcome_b_key,
+                                'odds_a': odds_a_option['odds'],
+                                'odds_b': odds_b_option['odds'],
+                                'bookmaker_a': odds_a_option['bookmaker'],
+                                'bookmaker_b': odds_b_option['bookmaker'],
+                                'bookmaker_a_raw': odds_a_option.get('raw_name', outcome_a_key),
+                                'bookmaker_b_raw': odds_b_option.get('raw_name', outcome_b_key),
+                                'odds_rank_a': i,  # 0=best, 1=2nd, 2=3rd
+                                'odds_rank_b': j,
+                                'commence_time': commence_time,
+                                'event_name': f"{home_team} vs {away_team}"
+                            })
+
                 # Handle 3-way markets (soccer/hockey h2h with draw)
-                elif len(best_odds) == 3 and config.is_three_way_sport(sport) and market_key == 'h2h':
-                    # Ensure we have Home, Draw, Away outcomes
-                    processed_matches.append({
-                        'sport': sport,
-                        'market': market_key,
-                        'num_outcomes': 3,
-                        'player_a': outcomes[0],  # Home
-                        'player_draw': outcomes[1] if 'draw' in outcomes[1].lower() else outcomes[2],  # Draw
-                        'player_b': outcomes[2] if 'draw' in outcomes[1].lower() else outcomes[1],  # Away
-                        'odds_a': best_odds[outcomes[0]]['odds'],
-                        'odds_draw': best_odds[outcomes[1] if 'draw' in outcomes[1].lower() else outcomes[2]]['odds'],
-                        'odds_b': best_odds[outcomes[2] if 'draw' in outcomes[1].lower() else outcomes[1]]['odds'],
-                        'bookmaker_a': best_odds[outcomes[0]]['bookmaker'],
-                        'bookmaker_draw': best_odds[outcomes[1] if 'draw' in outcomes[1].lower() else outcomes[2]]['bookmaker'],
-                        'bookmaker_b': best_odds[outcomes[2] if 'draw' in outcomes[1].lower() else outcomes[1]]['bookmaker'],
-                        'commence_time': commence_time,
-                        'event_name': f"{home_team} vs {away_team}"
-                    })
-        
+                elif len(outcome_keys) == 3 and config.is_three_way_sport(sport) and market_key == 'h2h':
+                    # Find HOME, AWAY, DRAW outcomes
+                    home_outcome = next((k for k in outcome_keys if k == 'HOME'), None)
+                    away_outcome = next((k for k in outcome_keys if k == 'AWAY'), None)
+                    draw_outcome = next((k for k in outcome_keys if k == 'DRAW'), None)
+
+                    if home_outcome and away_outcome and draw_outcome:
+                        home_list = outcome_odds[home_outcome]
+                        away_list = outcome_odds[away_outcome]
+                        draw_list = outcome_odds[draw_outcome]
+
+                        # Generate opportunities for top 3 combinations
+                        for i, odds_home in enumerate(home_list[:3]):
+                            for j, odds_draw in enumerate(draw_list[:3]):
+                                for k, odds_away in enumerate(away_list[:3]):
+                                    processed_matches.append({
+                                        'sport': sport,
+                                        'market': market_key,
+                                        'num_outcomes': 3,
+                                        'player_a': home_outcome,
+                                        'player_draw': draw_outcome,
+                                        'player_b': away_outcome,
+                                        'odds_a': odds_home['odds'],
+                                        'odds_draw': odds_draw['odds'],
+                                        'odds_b': odds_away['odds'],
+                                        'bookmaker_a': odds_home['bookmaker'],
+                                        'bookmaker_draw': odds_draw['bookmaker'],
+                                        'bookmaker_b': odds_away['bookmaker'],
+                                        'odds_rank_a': i,
+                                        'odds_rank_draw': j,
+                                        'odds_rank_b': k,
+                                        'commence_time': commence_time,
+                                        'event_name': f"{home_team} vs {away_team}"
+                                    })
+
         return processed_matches
     
+    def find_cross_market_arbitrage(self, match_data: Dict) -> List[Dict]:
+        """
+        Find arbitrage opportunities by combining different market types.
+
+        For example: h2h odds + spread odds can create arbitrage.
+        Team A moneyline 2.00 + Team B spread +3.5 at 2.05
+        creates arbitrage if the outcomes don't overlap perfectly.
+
+        Args:
+            match_data: Single match data with multiple bookmakers
+
+        Returns:
+            List of cross-market arbitrage opportunities
+        """
+        cross_market_opps = []
+
+        if not match_data.get('bookmakers'):
+            return cross_market_opps
+
+        home_team = match_data.get('home_team', 'Unknown')
+        away_team = match_data.get('away_team', 'Unknown')
+        commence_time = match_data.get('commence_time', '')
+
+        # Build market data by outcome type
+        # {outcome_type: {market_type: {point: [(odds, bookmaker)]}}}
+        market_combinations = {}
+
+        for bookmaker in match_data['bookmakers']:
+            bookmaker_name = bookmaker.get('title', 'Unknown')
+
+            for market in bookmaker.get('markets', []):
+                market_key = market.get('key')
+
+                for outcome in market.get('outcomes', []):
+                    odds = outcome.get('price')
+
+                    # Skip invalid odds
+                    if not odds or odds < 1.0 or odds > 1000:
+                        continue
+
+                    # Identify outcome type
+                    outcome_type = identify_outcome_type(outcome.get('name'), home_team, away_team)
+
+                    if outcome_type == 'OTHER':
+                        continue  # Skip unidentifiable outcomes
+
+                    # Create key for this outcome/market combination
+                    if market_key == 'h2h':
+                        combo_key = f"{outcome_type}"
+                    else:
+                        point = outcome.get('point')
+                        combo_key = f"{outcome_type}_{point}"
+
+                    # Store the odds option
+                    if combo_key not in market_combinations:
+                        market_combinations[combo_key] = []
+
+                    market_combinations[combo_key].append({
+                        'odds': odds,
+                        'bookmaker': bookmaker_name,
+                        'market': market_key,
+                        'point': outcome.get('point'),
+                        'raw_name': outcome.get('name')
+                    })
+
+        # Now try combinations across different market types
+        # Look for HOME outcomes with different points/markets
+        home_outcomes = {k: v for k, v in market_combinations.items() if k.startswith('HOME')}
+        away_outcomes = {k: v for k, v in market_combinations.items() if k.startswith('AWAY')}
+
+        # Try HOME from one market type with AWAY from another
+        for home_key, home_options in home_outcomes.items():
+            for away_key, away_options in away_outcomes.items():
+                # Skip if they're from the same market and point (would be captured by 2-way)
+                home_point = home_key.split('_')[1] if '_' in home_key else None
+                away_point = away_key.split('_')[1] if '_' in away_key else None
+
+                # Try top 2 odds for each
+                for home_opt in home_options[:2]:
+                    for away_opt in away_options[:2]:
+                        odds_home = home_opt['odds']
+                        odds_away = away_opt['odds']
+
+                        # Calculate if this is valid arbitrage
+                        profit_margin = calculate_arbitrage_profit(odds_home, odds_away)
+
+                        if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
+                            # This is a cross-market arbitrage opportunity
+                            stakes_result = calculate_stakes_with_validation(
+                                odds_home, odds_away, config.DEFAULT_STAKE
+                            )
+
+                            if stakes_result is not None:
+                                stake_a, stake_b = stakes_result
+                                guaranteed_profit = calculate_guaranteed_profit(
+                                    odds_home, odds_away, stake_a, stake_b
+                                )
+
+                                cross_market_opps.append({
+                                    'sport': match_data.get('sport', 'Unknown'),
+                                    'market': 'cross_market',  # Special marker
+                                    'num_outcomes': 2,
+                                    'player_a': home_key,
+                                    'player_b': away_key,
+                                    'odds_a': odds_home,
+                                    'odds_b': odds_away,
+                                    'bookmaker_a': home_opt['bookmaker'],
+                                    'bookmaker_b': away_opt['bookmaker'],
+                                    'market_a': home_opt['market'],
+                                    'market_b': away_opt['market'],
+                                    'point_a': home_opt.get('point'),
+                                    'point_b': away_opt.get('point'),
+                                    'profit_margin': profit_margin,
+                                    'stake_a': stake_a,
+                                    'stake_b': stake_b,
+                                    'guaranteed_profit': guaranteed_profit,
+                                    'total_stake': config.DEFAULT_STAKE,
+                                    'is_cross_market': True,
+                                    'commence_time': commence_time,
+                                    'event_name': f"{home_team} vs {away_team}"
+                                })
+
+        return cross_market_opps
+
     def find_arbitrage_opportunities(self, matches: List[Dict]) -> List[Dict]:
         """
         Identify arbitrage opportunities from processed matches (2-way and 3-way).
-        
+        Uses validated stakes that survive rounding.
+
         Args:
             matches: List of processed match dictionaries
-        
+
         Returns:
-            List of arbitrage opportunities with profit calculations
+            List of arbitrage opportunities with verified profit calculations
         """
         opportunities = []
-        
+
         for match in matches:
             num_outcomes = match.get('num_outcomes', 2)
-            
+
             if num_outcomes == 2:
                 # 2-way arbitrage (combat sports, totals, spreads)
                 odds_a = match['odds_a']
                 odds_b = match['odds_b']
-                
+
                 # Calculate profit margin
                 profit_margin = calculate_arbitrage_profit(odds_a, odds_b)
-                
+
                 # Check if meets minimum threshold
                 if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
-                    # Calculate stakes
-                    stake_a, stake_b = calculate_stakes(
+                    # Calculate and validate stakes (handles rounding)
+                    stakes_result = calculate_stakes_with_validation(
                         odds_a, odds_b, config.DEFAULT_STAKE
                     )
-                    
+
+                    if stakes_result is None:
+                        # Arbitrage is broken by rounding, skip this opportunity
+                        continue
+
+                    stake_a, stake_b = stakes_result
+
                     # Calculate guaranteed profit
                     guaranteed_profit = calculate_guaranteed_profit(
                         odds_a, odds_b, stake_a, stake_b
                     )
-                    
+
                     # Create opportunity dict
                     opportunity = {
                         **match,
@@ -229,32 +419,51 @@ class ArbitrageFinder:
                         'stake_a': stake_a,
                         'stake_b': stake_b,
                         'guaranteed_profit': guaranteed_profit,
-                        'total_stake': config.DEFAULT_STAKE
+                        'total_stake': config.DEFAULT_STAKE,
+                        'is_rounded': True  # Flag that stakes were validated after rounding
                     }
-                    
+
                     opportunities.append(opportunity)
-            
+
             elif num_outcomes == 3:
                 # 3-way arbitrage (soccer/hockey with draw)
                 odds_a = match['odds_a']
                 odds_draw = match['odds_draw']
                 odds_b = match['odds_b']
-                
+
                 # Calculate profit margin
                 profit_margin = calculate_three_way_arbitrage(odds_a, odds_draw, odds_b)
-                
+
                 # Check if meets minimum threshold
                 if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
-                    # Calculate stakes
-                    stake_a, stake_draw, stake_b = calculate_three_way_stakes(
-                        odds_a, odds_draw, odds_b, config.DEFAULT_STAKE
-                    )
-                    
+                    # For 3-way, calculate stakes the traditional way then verify
+                    denominator = (1 / odds_a) + (1 / odds_draw) + (1 / odds_b)
+                    stake_a_ideal = config.DEFAULT_STAKE * (1 / odds_a) / denominator
+                    stake_draw_ideal = config.DEFAULT_STAKE * (1 / odds_draw) / denominator
+                    stake_b_ideal = config.DEFAULT_STAKE * (1 / odds_b) / denominator
+
+                    # Round to cents
+                    stake_a = round(stake_a_ideal, 2)
+                    stake_draw = round(stake_draw_ideal, 2)
+                    stake_b = round(config.DEFAULT_STAKE - stake_a - stake_draw, 2)
+
+                    # Verify returns are equal within tolerance
+                    return_a = stake_a * odds_a
+                    return_draw = stake_draw * odds_draw
+                    return_b = stake_b * odds_b
+
+                    max_return = max(return_a, return_draw, return_b)
+                    min_return = min(return_a, return_draw, return_b)
+
+                    if max_return - min_return > 0.01:
+                        # Rounding broke the arbitrage, skip
+                        continue
+
                     # Calculate guaranteed profit
                     guaranteed_profit = calculate_three_way_profit(
                         odds_a, odds_draw, odds_b, stake_a, stake_draw, stake_b
                     )
-                    
+
                     # Create opportunity dict
                     opportunity = {
                         **match,
@@ -263,11 +472,12 @@ class ArbitrageFinder:
                         'stake_draw': stake_draw,
                         'stake_b': stake_b,
                         'guaranteed_profit': guaranteed_profit,
-                        'total_stake': config.DEFAULT_STAKE
+                        'total_stake': config.DEFAULT_STAKE,
+                        'is_rounded': True
                     }
-                    
+
                     opportunities.append(opportunity)
-        
+
         return opportunities
     
     def create_alert_key(self, opportunity: Dict) -> str:
@@ -446,36 +656,49 @@ class ArbitrageFinder:
     def check_for_arbitrage(self):
         """
         Main function to check for arbitrage opportunities.
-        Fetches odds, processes them, and alerts on opportunities.
+        Fetches odds, processes them (including cross-market), and alerts on opportunities.
         """
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"\n[{current_time}] Checking for arbitrage opportunities...")
-        
+
         all_opportunities = []
-        
+        cross_market_count = 0
+
         # Fetch and process odds for each sport
         for sport in config.SPORTS:
             print(f"[{sport}] Fetching odds...")
             odds_data = self.fetch_odds(sport)
-            
+
             if odds_data:
                 print(f"[{sport}] Found {len(odds_data)} matches")
-                
-                # Process odds
+
+                # Process odds (single market per match)
                 processed_matches = self.process_odds(odds_data, sport)
-                print(f"[{sport}] Processed {len(processed_matches)} matches with complete odds")
-                
-                # Find arbitrage opportunities
+                print(f"[{sport}] Processed {len(processed_matches)} single-market opportunities")
+
+                # Find standard arbitrage opportunities
                 opportunities = self.find_arbitrage_opportunities(processed_matches)
-                
+
                 if opportunities:
-                    print(f"[{sport}] Found {len(opportunities)} arbitrage opportunities!")
+                    print(f"[{sport}] Found {len(opportunities)} standard arbitrage opportunities!")
                     all_opportunities.extend(opportunities)
+
+                # Also check for cross-market arbitrage
+                cross_market_opportunities = []
+                for match_data in odds_data:
+                    match_data['sport'] = sport  # Add sport to match data
+                    cross_opps = self.find_cross_market_arbitrage(match_data)
+                    cross_market_opportunities.extend(cross_opps)
+
+                if cross_market_opportunities:
+                    print(f"[{sport}] Found {len(cross_market_opportunities)} cross-market arbitrage opportunities!")
+                    cross_market_count += len(cross_market_opportunities)
+                    all_opportunities.extend(cross_market_opportunities)
                 else:
-                    print(f"[{sport}] No arbitrage opportunities found")
+                    print(f"[{sport}] No cross-market arbitrage opportunities found")
             else:
                 print(f"[{sport}] Failed to fetch odds")
-        
+
         # Display alerts for new opportunities that pass filters
         new_opportunities = 0
         filtered_count = 0
@@ -484,25 +707,28 @@ class ArbitrageFinder:
             opportunity_id = None
             if self.db:
                 opportunity_id = self.db.log_opportunity(opp)
-            
+
             # Check if passes smart filters
             passes, reason = self.passes_filters(opp)
             if not passes:
                 filtered_count += 1
                 continue
-            
+
             # Check if not a duplicate
             if self.should_alert(opp):
                 self.display_alert(opp)
                 new_opportunities += 1
-                
+
                 # Log alert to database
                 if self.db and opportunity_id:
                     self.db.log_alert(opportunity_id)
-        
+
         if filtered_count > 0:
             print(f"[INFO] Filtered out {filtered_count} opportunities (trust/timing/profit threshold)")
-        
+
+        if cross_market_count > 0:
+            print(f"[INFO] Cross-market opportunities detected: {cross_market_count}")
+
         if new_opportunities == 0 and len(all_opportunities) > 0:
             remaining = len(all_opportunities) - filtered_count
             if remaining > 0:
@@ -511,7 +737,7 @@ class ArbitrageFinder:
                 print("[INFO] No arbitrage opportunities found in this check")
         elif new_opportunities == 0:
             print("[INFO] No arbitrage opportunities found in this check")
-        
+
         print(f"[INFO] Total API calls made: {self.api_call_count}")
 
 
