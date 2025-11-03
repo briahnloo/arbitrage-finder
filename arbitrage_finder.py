@@ -26,7 +26,8 @@ from utils import (
     identify_outcome_type,
     create_canonical_outcome_key,
     verify_stakes_after_rounding,
-    calculate_stakes_with_validation
+    calculate_stakes_with_validation,
+    calculate_market_confidence
 )
 
 # Import database if logging enabled
@@ -483,14 +484,19 @@ class ArbitrageFinder:
     def create_alert_key(self, opportunity: Dict) -> str:
         """
         Create a unique key for an opportunity to track duplicates.
-        
+        Includes profit tier so different profit levels are treated as different opportunities.
+
         Args:
             opportunity: Opportunity dictionary
-        
+
         Returns:
             Unique string key
         """
-        return f"{opportunity['player_a']}_vs_{opportunity['player_b']}_{opportunity['bookmaker_a']}_{opportunity['bookmaker_b']}"
+        # Group profit margins into tiers (0.5% ranges)
+        # So 1.2% and 1.8% trigger new alerts, but 1.2% and 1.25% don't
+        profit_tier = int(opportunity['profit_margin'] * 2) / 2  # Round to nearest 0.5%
+
+        return f"{opportunity['player_a']}_vs_{opportunity['player_b']}_{opportunity['bookmaker_a']}_{opportunity['bookmaker_b']}_profit_{profit_tier:.1f}"
     
     def passes_filters(self, opportunity: Dict) -> tuple:
         """
@@ -602,48 +608,84 @@ class ArbitrageFinder:
         market_display = config.MARKET_DISPLAY_NAMES.get(market_type, market_type)
         print(f"{CYAN}Market:{RESET} {market_display}")
         print()
-        
+
         print(f"{YELLOW}{BOLD}Profit Margin: {opportunity['profit_margin']:.2f}%{RESET}")
+
+        # Calculate and display confidence
+        odds_rank_a = opportunity.get('odds_rank_a', 0)
+        odds_rank_b = opportunity.get('odds_rank_b', 0)
+        odds_rank_draw = opportunity.get('odds_rank_draw', 0)
+        is_cross_market = opportunity.get('is_cross_market', False)
+
+        confidence, confidence_label = calculate_market_confidence(
+            market_type,
+            odds_rank_a=odds_rank_a,
+            odds_rank_b=odds_rank_b,
+            odds_rank_draw=odds_rank_draw
+        )
+
+        confidence_color = GREEN if confidence_label == "HIGH" else YELLOW if confidence_label == "MEDIUM" else '\033[91m'
+        print(f"Confidence: {confidence_color}{confidence_label}{RESET} ({confidence:.0f}%)")
+
+        if is_cross_market:
+            print(f"{CYAN}[CROSS-MARKET ARBITRAGE]{RESET}")
+
+        if odds_rank_a > 0 or odds_rank_b > 0:
+            confidence_note = "⚠️ Using alternative odds (not best available)"
+            if odds_rank_a == 1 or odds_rank_b == 1:
+                confidence_note = "⚠️ Using 2nd-best odds for one outcome"
+            if odds_rank_a == 2 or odds_rank_b == 2:
+                confidence_note = "⚠️ Using 3rd-best odds (lower confidence)"
+            print(f"{YELLOW}{confidence_note}{RESET}")
+
         print()
-        
+
         # Check if 2-way or 3-way arbitrage
         num_outcomes = opportunity.get('num_outcomes', 2)
-        
+
         if num_outcomes == 2:
             # Display 2-way arbitrage (2 bets)
+            rank_a_label = f" (#{odds_rank_a + 1})" if odds_rank_a > 0 else ""
+            rank_b_label = f" (#{odds_rank_b + 1})" if odds_rank_b > 0 else ""
+
             print(f"{BOLD}BET 1:{RESET}")
             print(f"  Outcome: {opportunity['player_a']}")
-            print(f"  Bookmaker: {opportunity['bookmaker_a']}")
+            print(f"  Bookmaker: {opportunity['bookmaker_a']}{rank_a_label}")
             print(f"  Odds: {opportunity['odds_a']:.2f}")
             print(f"  Stake: {format_currency(opportunity['stake_a'])}")
             print()
-            
+
             print(f"{BOLD}BET 2:{RESET}")
             print(f"  Outcome: {opportunity['player_b']}")
-            print(f"  Bookmaker: {opportunity['bookmaker_b']}")
+            print(f"  Bookmaker: {opportunity['bookmaker_b']}{rank_b_label}")
             print(f"  Odds: {opportunity['odds_b']:.2f}")
             print(f"  Stake: {format_currency(opportunity['stake_b'])}")
             print()
-        
+
         elif num_outcomes == 3:
             # Display 3-way arbitrage (3 bets)
+            odds_rank_draw = opportunity.get('odds_rank_draw', 0)
+            rank_a_label = f" (#{odds_rank_a + 1})" if odds_rank_a > 0 else ""
+            rank_draw_label = f" (#{odds_rank_draw + 1})" if odds_rank_draw > 0 else ""
+            rank_b_label = f" (#{odds_rank_b + 1})" if odds_rank_b > 0 else ""
+
             print(f"{BOLD}BET 1 (Home/Win):{RESET}")
             print(f"  Outcome: {opportunity['player_a']}")
-            print(f"  Bookmaker: {opportunity['bookmaker_a']}")
+            print(f"  Bookmaker: {opportunity['bookmaker_a']}{rank_a_label}")
             print(f"  Odds: {opportunity['odds_a']:.2f}")
             print(f"  Stake: {format_currency(opportunity['stake_a'])}")
             print()
-            
+
             print(f"{BOLD}BET 2 (Draw):{RESET}")
             print(f"  Outcome: {opportunity['player_draw']}")
-            print(f"  Bookmaker: {opportunity['bookmaker_draw']}")
+            print(f"  Bookmaker: {opportunity['bookmaker_draw']}{rank_draw_label}")
             print(f"  Odds: {opportunity['odds_draw']:.2f}")
             print(f"  Stake: {format_currency(opportunity['stake_draw'])}")
             print()
-            
+
             print(f"{BOLD}BET 3 (Away/Loss):{RESET}")
             print(f"  Outcome: {opportunity['player_b']}")
-            print(f"  Bookmaker: {opportunity['bookmaker_b']}")
+            print(f"  Bookmaker: {opportunity['bookmaker_b']}{rank_b_label}")
             print(f"  Odds: {opportunity['odds_b']:.2f}")
             print(f"  Stake: {format_currency(opportunity['stake_b'])}")
             print()

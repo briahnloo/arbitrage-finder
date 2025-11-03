@@ -287,6 +287,50 @@ def calculate_three_way_profit(odds_a: float, odds_draw: float, odds_b: float,
     return guaranteed_return - total_investment
 
 
+def calculate_market_confidence(market_type: str, odds_rank_a: int = 0, odds_rank_b: int = 0,
+                                odds_rank_draw: int = 0) -> tuple:
+    """
+    Calculate confidence score based on market type and odds ranking.
+
+    Args:
+        market_type: Type of market ('h2h', 'spreads', 'totals', 'cross_market')
+        odds_rank_a: Rank of odds A (0=best, 1=2nd, 2=3rd)
+        odds_rank_b: Rank of odds B
+        odds_rank_draw: Rank of draw odds (for 3-way)
+
+    Returns:
+        Tuple of (confidence_percentage: float, confidence_label: str)
+    """
+    # Base confidence by market type
+    # h2h is most liquid and tight (odds more likely correct)
+    base_confidence = {
+        'h2h': 90,
+        'spreads': 75,
+        'totals': 70,
+        'cross_market': 80
+    }
+
+    market_confidence = base_confidence.get(market_type, 50)
+
+    # Adjust for odds ranking (using alternative odds reduces confidence)
+    max_rank = max(odds_rank_a, odds_rank_b, odds_rank_draw)
+
+    if max_rank == 1:  # Using 2nd best odds
+        market_confidence *= 0.95  # 5% reduction
+    elif max_rank == 2:  # Using 3rd best odds
+        market_confidence *= 0.85  # 15% reduction
+
+    # Determine label
+    if market_confidence >= 85:
+        label = "HIGH"
+    elif market_confidence >= 70:
+        label = "MEDIUM"
+    else:
+        label = "LOW"
+
+    return (round(market_confidence, 1), label)
+
+
 def get_sport_display_name(sport_key: str) -> str:
     """
     Convert sport key to display-friendly name.
