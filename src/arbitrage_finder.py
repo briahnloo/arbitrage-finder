@@ -9,6 +9,10 @@ import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import sys
+import logging
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 from src import config
 from src.utils import (
