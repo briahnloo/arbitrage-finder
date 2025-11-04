@@ -193,7 +193,7 @@ class ArbitrageFinder:
                     if config.is_three_way_sport(sport) and market_key == 'h2h':
                         # This is soccer/hockey h2h but only has 2 outcomes (missing draw)
                         # Skip this - it's not safe arbitrage (draw would lose both bets)
-                        logger.warning(f"Skipping 2-way {sport} h2h (missing draw outcome). Event: {home_team} vs {away_team}")
+                        # Silently skip - will check for 3-way instead
                         continue
 
                     outcome_a_key = outcome_keys[0]
@@ -393,8 +393,7 @@ class ArbitrageFinder:
                                     # SAFETY CHECK: Reject 2-way for sports with draws
                                     if config.is_three_way_sport(sport):
                                         # Soccer/hockey must be 3-way (with draw)
-                                        # 2-way is NOT risk-free
-                                        logger.warning(f"REJECTED: 2-way {sport} h2h detected in cross-market. Event: {home_team} vs {away_team}. Must use 3-way with draw.")
+                                        # 2-way is NOT risk-free - skip silently
                                         continue
 
                                     cross_market_opps.append({
@@ -568,7 +567,7 @@ class ArbitrageFinder:
                 # SAFETY CHECK: Never show 2-way for sports with draws (soccer/hockey)
                 # 2-way soccer is NOT risk-free (draw loses both bets)
                 if config.is_three_way_sport(sport) and market == 'h2h':
-                    logger.warning(f"REJECTED: 2-way {sport} h2h detected. This is not safe arbitrage. Event: {match.get('event_name')}")
+                    # Silently skip - not safe for sports where draws are possible
                     continue
 
                 # Calculate profit margin
