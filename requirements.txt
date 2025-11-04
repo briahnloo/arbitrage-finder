@@ -1,4 +1,29 @@
+# Core Dependencies
 requests>=2.31.0
 python-dotenv>=1.0.0
 schedule>=1.2.0
+
+# Discord Bot Integration
+discord.py>=2.3.0
+
+# Payment Processing (Stripe)
+stripe>=7.0.0
+
+# Async HTTP
+aiohttp>=3.9.0
+
+# Data Processing
+pandas>=2.0.0
+
+# Logging
+python-json-logger>=2.0.0
+
+# Utilities
+httpx>=0.24.0
+
+# Development/Testing
+black>=23.0.0
+flake8>=6.0.0
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
 
