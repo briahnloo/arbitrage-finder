@@ -390,6 +390,13 @@ class ArbitrageFinder:
                                 if is_arb_valid:
                                     guaranteed_profit = validation_results['profit_range'][0]
 
+                                    # SAFETY CHECK: Reject 2-way for sports with draws
+                                    if config.is_three_way_sport(sport):
+                                        # Soccer/hockey must be 3-way (with draw)
+                                        # 2-way is NOT risk-free
+                                        logger.warning(f"REJECTED: 2-way {sport} h2h detected in cross-market. Event: {home_team} vs {away_team}. Must use 3-way with draw.")
+                                        continue
+
                                     cross_market_opps.append({
                                         'sport': sport,
                                         'market': 'h2h_moneyline',
