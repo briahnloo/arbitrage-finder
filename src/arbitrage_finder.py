@@ -414,6 +414,115 @@ class ArbitrageFinder:
                                         'validation_notes': validation_reason
                                     })
 
+        # Strategy 1b: 3-way H2H arbitrage (HOME vs DRAW vs AWAY) - for soccer/hockey
+        # This is the ONLY safe way to bet soccer (covers all outcomes)
+        if config.is_three_way_sport(sport) and 'HOME' in market_combinations and 'DRAW' in market_combinations and 'AWAY' in market_combinations:
+            home_opts = market_combinations['HOME']
+            draw_opts = market_combinations['DRAW']
+            away_opts = market_combinations['AWAY']
+
+            # Build outcome dicts for validation
+            outcome_home = {
+                'outcome_type': OutcomeType.HOME_WIN,
+                'spread': None,
+                'total': None
+            }
+            outcome_draw = {
+                'outcome_type': OutcomeType.DRAW,
+                'spread': None,
+                'total': None
+            }
+            outcome_away = {
+                'outcome_type': OutcomeType.AWAY_WIN,
+                'spread': None,
+                'total': None
+            }
+
+            # Get best odds for each outcome
+            home_opt = home_opts[0]
+            draw_opt = draw_opts[0]
+            away_opt = away_opts[0]
+
+            odds_home = home_opt['odds']
+            odds_draw = draw_opt['odds']
+            odds_away = away_opt['odds']
+
+            # Calculate profit margin
+            profit_margin = calculate_three_way_arbitrage(odds_home, odds_draw, odds_away)
+
+            if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
+                # Calculate stakes
+                stakes_result = calculate_stakes_with_validation(
+                    odds_home, odds_draw, odds_away, config.DEFAULT_STAKE
+                )
+
+                if stakes_result:
+                    # For 3-way, we need to handle this differently
+                    # Use calculate_three_way_stakes instead
+                    denominator = (1 / odds_home) + (1 / odds_draw) + (1 / odds_away)
+                    stake_a = config.DEFAULT_STAKE * (1 / odds_home) / denominator
+                    stake_draw = config.DEFAULT_STAKE * (1 / odds_draw) / denominator
+                    stake_b = config.DEFAULT_STAKE * (1 / odds_away) / denominator
+
+                    # Adjust stakes to ensure exact $100 total and equal returns
+                    total_stake = stake_a + stake_draw + stake_b
+                    if abs(total_stake - config.DEFAULT_STAKE) > 0.01:
+                        # Normalize to exactly $100
+                        ratio = config.DEFAULT_STAKE / total_stake
+                        stake_a *= ratio
+                        stake_draw *= ratio
+                        stake_b *= ratio
+
+                    # Round to cents
+                    stake_a = round(stake_a, 2)
+                    stake_draw = round(stake_draw, 2)
+                    stake_b = round(config.DEFAULT_STAKE - stake_a - stake_draw, 2)
+
+                    # Validate stakes
+                    is_valid, adj_stake_a, adj_stake_draw, adj_stake_b, stake_reason = (
+                        True, stake_a, stake_draw, stake_b, "Stakes balanced"
+                    )
+
+                    if is_valid:
+                        # Scenario validate the opportunity
+                        is_arb_valid, validation_reason, validation_results = validator.validate_three_way_arbitrage(
+                            outcome_home, outcome_draw, outcome_away,
+                            adj_stake_a, adj_stake_draw, adj_stake_b,
+                            odds_home, odds_draw, odds_away, sport
+                        )
+
+                        if is_arb_valid:
+                            guaranteed_profit = validation_results['profit_range'][0]
+
+                            cross_market_opps.append({
+                                'sport': sport,
+                                'market': 'h2h_three_way',
+                                'num_outcomes': 3,
+                                'player_a': 'HOME',
+                                'player_draw': 'DRAW',
+                                'player_b': 'AWAY',
+                                'odds_a': odds_home,
+                                'odds_draw': odds_draw,
+                                'odds_b': odds_away,
+                                'bookmaker_a': home_opt['bookmaker'],
+                                'bookmaker_draw': draw_opt['bookmaker'],
+                                'bookmaker_b': away_opt['bookmaker'],
+                                'market_a': home_opt['market'],
+                                'market_draw': draw_opt['market'],
+                                'market_b': away_opt['market'],
+                                'profit_margin': profit_margin,
+                                'stake_a': adj_stake_a,
+                                'stake_draw': adj_stake_draw,
+                                'stake_b': adj_stake_b,
+                                'guaranteed_profit': guaranteed_profit,
+                                'total_stake': config.DEFAULT_STAKE,
+                                'is_cross_market': False,
+                                'is_validated': True,
+                                'commence_time': commence_time,
+                                'event_name': f"{home_team} vs {away_team}",
+                                'validation_notes': validation_reason
+                            })
+
         # Strategy 2: Spread + Moneyline (only valid specific combinations)
         # HOME -X (spread) vs AWAY (moneyline) is INVALID because:
         # - HOME -1.5 means home wins by 2+
