@@ -49,6 +49,10 @@ MARKET_DISPLAY_NAMES = {
 MINIMUM_PROFIT_THRESHOLD = 1.0  # Minimum profit percentage to trigger alert (1.0%)
 DEFAULT_STAKE = 100  # Default total investment amount in dollars ($100)
 
+# Output Configuration
+SHOW_INDIVIDUAL_ALERTS = True  # Show individual alerts for each opportunity (default: True)
+TOP_OPPORTUNITIES_COUNT = 5  # Number of top opportunities to display in summary (default: 5)
+
 # Dynamic check intervals (minutes) based on time of day
 PEAK_HOURS_START = 17  # 5pm
 PEAK_HOURS_END = 23    # 11pm

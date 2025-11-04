@@ -293,7 +293,7 @@ def calculate_market_confidence(market_type: str, odds_rank_a: int = 0, odds_ran
     Calculate confidence score based on market type and odds ranking.
 
     Args:
-        market_type: Type of market ('h2h', 'spreads', 'totals', 'cross_market')
+        market_type: Type of market ('h2h', 'spreads', 'totals', 'cross_market', 'h2h_moneyline')
         odds_rank_a: Rank of odds A (0=best, 1=2nd, 2=3rd)
         odds_rank_b: Rank of odds B
         odds_rank_draw: Rank of draw odds (for 3-way)
@@ -305,6 +305,7 @@ def calculate_market_confidence(market_type: str, odds_rank_a: int = 0, odds_ran
     # h2h is most liquid and tight (odds more likely correct)
     base_confidence = {
         'h2h': 90,
+        'h2h_moneyline': 90,  # Same as h2h - pure moneyline bets
         'spreads': 75,
         'totals': 70,
         'cross_market': 80

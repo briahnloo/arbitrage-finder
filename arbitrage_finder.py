@@ -5,7 +5,6 @@ and displays alerts in the console.
 """
 
 import requests
-import schedule
 import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -29,6 +28,8 @@ from utils import (
     calculate_stakes_with_validation,
     calculate_market_confidence
 )
+from arbitrage_validator import ArbitrageValidator, StakeValidator, OutcomePartition, OutcomeType
+from realworld_constraints import RealWorldValidator
 
 # Import database if logging enabled
 if config.ENABLE_DATABASE_LOGGING:
@@ -43,6 +44,7 @@ class ArbitrageFinder:
         self.recent_alerts = {}  # Track recent alerts to avoid duplicates
         self.api_call_count = 0
         self.last_api_call_time = None
+        self.cycle_number = 0  # Track iteration cycles
         
         # Initialize database if enabled
         self.db = None
@@ -251,15 +253,14 @@ class ArbitrageFinder:
         """
         Find arbitrage opportunities by combining different market types.
 
-        For example: h2h odds + spread odds can create arbitrage.
-        Team A moneyline 2.00 + Team B spread +3.5 at 2.05
-        creates arbitrage if the outcomes don't overlap perfectly.
+        FIXED: Now validates that outcomes are truly mutually exclusive and partition
+        the outcome space. Rejects combinations that don't cover all scenarios.
 
         Args:
             match_data: Single match data with multiple bookmakers
 
         Returns:
-            List of cross-market arbitrage opportunities
+            List of valid cross-market arbitrage opportunities
         """
         cross_market_opps = []
 
@@ -269,9 +270,9 @@ class ArbitrageFinder:
         home_team = match_data.get('home_team', 'Unknown')
         away_team = match_data.get('away_team', 'Unknown')
         commence_time = match_data.get('commence_time', '')
+        sport = match_data.get('sport', 'Unknown')
 
-        # Build market data by outcome type
-        # {outcome_type: {market_type: {point: [(odds, bookmaker)]}}}
+        # Build comprehensive market data
         market_combinations = {}
 
         for bookmaker in match_data['bookmakers']:
@@ -291,7 +292,7 @@ class ArbitrageFinder:
                     outcome_type = identify_outcome_type(outcome.get('name'), home_team, away_team)
 
                     if outcome_type == 'OTHER':
-                        continue  # Skip unidentifiable outcomes
+                        continue
 
                     # Create key for this outcome/market combination
                     if market_key == 'h2h':
@@ -300,7 +301,6 @@ class ArbitrageFinder:
                         point = outcome.get('point')
                         combo_key = f"{outcome_type}_{point}"
 
-                    # Store the odds option
                     if combo_key not in market_combinations:
                         market_combinations[combo_key] = []
 
@@ -312,69 +312,109 @@ class ArbitrageFinder:
                         'raw_name': outcome.get('name')
                     })
 
-        # Now try combinations across different market types
-        # Look for HOME outcomes with different points/markets
-        home_outcomes = {k: v for k, v in market_combinations.items() if k.startswith('HOME')}
-        away_outcomes = {k: v for k, v in market_combinations.items() if k.startswith('AWAY')}
+        # FIXED: Only combine outcomes that are mutually exclusive and partition outcome space
+        # Valid combinations:
+        # 1. HOME (h2h) vs AWAY (h2h) - moneyline arbitrage
+        # 2. HOME_X (spread) vs AWAY_Y (spread) - only if they partition outcomes
+        # 3. HOME_X (spread) vs HOME (h2h) - ONLY if mutually exclusive (home spread vs away ml)
+        #    Actually this is: home covers spread vs away wins (moneyline)
 
-        # Try HOME from one market type with AWAY from another
-        for home_key, home_options in home_outcomes.items():
-            for away_key, away_options in away_outcomes.items():
-                # Skip if they're from the same market and point (would be captured by 2-way)
-                home_point = home_key.split('_')[1] if '_' in home_key else None
-                away_point = away_key.split('_')[1] if '_' in away_key else None
+        validator = ArbitrageValidator()
+        partition_validator = OutcomePartition()
+        stake_validator = StakeValidator()
 
-                # Try top 2 odds for each
-                for home_opt in home_options[:2]:
-                    for away_opt in away_options[:2]:
+        # Strategy 1: H2H moneyline arbitrage (HOME vs AWAY)
+        if 'HOME' in market_combinations and 'AWAY' in market_combinations:
+            home_opts = market_combinations['HOME']
+            away_opts = market_combinations['AWAY']
+
+            # Build outcome dicts for validation
+            outcome_home = {
+                'outcome_type': OutcomeType.HOME_WIN,
+                'spread': None,
+                'total': None
+            }
+            outcome_away = {
+                'outcome_type': OutcomeType.AWAY_WIN,
+                'spread': None,
+                'total': None
+            }
+
+            # Verify these outcomes partition the space
+            is_valid_partition, partition_reason = partition_validator.validate_two_way_partition(
+                outcome_home, outcome_away, sport
+            )
+
+            if is_valid_partition:
+                for home_opt in home_opts[:2]:
+                    for away_opt in away_opts[:2]:
                         odds_home = home_opt['odds']
                         odds_away = away_opt['odds']
 
-                        # Calculate if this is valid arbitrage
                         profit_margin = calculate_arbitrage_profit(odds_home, odds_away)
 
                         if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
-                            # This is a cross-market arbitrage opportunity
                             stakes_result = calculate_stakes_with_validation(
                                 odds_home, odds_away, config.DEFAULT_STAKE
                             )
 
                             if stakes_result is not None:
                                 stake_a, stake_b = stakes_result
-                                guaranteed_profit = calculate_guaranteed_profit(
-                                    odds_home, odds_away, stake_a, stake_b
+
+                                # Validate stakes preserve $100 total
+                                is_valid, adj_stake_a, adj_stake_b, stake_reason = stake_validator.validate_and_adjust_stakes(
+                                    odds_home, odds_away, stake_a, stake_b, config.DEFAULT_STAKE
                                 )
 
-                                cross_market_opps.append({
-                                    'sport': match_data.get('sport', 'Unknown'),
-                                    'market': 'cross_market',  # Special marker
-                                    'num_outcomes': 2,
-                                    'player_a': home_key,
-                                    'player_b': away_key,
-                                    'odds_a': odds_home,
-                                    'odds_b': odds_away,
-                                    'bookmaker_a': home_opt['bookmaker'],
-                                    'bookmaker_b': away_opt['bookmaker'],
-                                    'market_a': home_opt['market'],
-                                    'market_b': away_opt['market'],
-                                    'point_a': home_opt.get('point'),
-                                    'point_b': away_opt.get('point'),
-                                    'profit_margin': profit_margin,
-                                    'stake_a': stake_a,
-                                    'stake_b': stake_b,
-                                    'guaranteed_profit': guaranteed_profit,
-                                    'total_stake': config.DEFAULT_STAKE,
-                                    'is_cross_market': True,
-                                    'commence_time': commence_time,
-                                    'event_name': f"{home_team} vs {away_team}"
-                                })
+                                if not is_valid:
+                                    continue
+
+                                # Scenario validate the opportunity
+                                is_arb_valid, validation_reason, validation_results = validator.validate_two_way_arbitrage(
+                                    outcome_home, outcome_away, adj_stake_a, adj_stake_b,
+                                    odds_home, odds_away, sport
+                                )
+
+                                if is_arb_valid:
+                                    guaranteed_profit = validation_results['profit_range'][0]
+
+                                    cross_market_opps.append({
+                                        'sport': sport,
+                                        'market': 'h2h_moneyline',
+                                        'num_outcomes': 2,
+                                        'player_a': 'HOME',
+                                        'player_b': 'AWAY',
+                                        'odds_a': odds_home,
+                                        'odds_b': odds_away,
+                                        'bookmaker_a': home_opt['bookmaker'],
+                                        'bookmaker_b': away_opt['bookmaker'],
+                                        'market_a': home_opt['market'],
+                                        'market_b': away_opt['market'],
+                                        'profit_margin': profit_margin,
+                                        'stake_a': adj_stake_a,
+                                        'stake_b': adj_stake_b,
+                                        'guaranteed_profit': guaranteed_profit,
+                                        'total_stake': config.DEFAULT_STAKE,
+                                        'is_cross_market': False,
+                                        'is_validated': True,
+                                        'commence_time': commence_time,
+                                        'event_name': f"{home_team} vs {away_team}",
+                                        'validation_notes': validation_reason
+                                    })
+
+        # Strategy 2: Spread + Moneyline (only valid specific combinations)
+        # HOME -X (spread) vs AWAY (moneyline) is INVALID because:
+        # - HOME -1.5 means home wins by 2+
+        # - AWAY means away wins by any amount
+        # - If away wins by 1, both lose (not arbitrage)
+        # NOT IMPLEMENTING invalid cross-market combinations
 
         return cross_market_opps
 
     def find_arbitrage_opportunities(self, matches: List[Dict]) -> List[Dict]:
         """
         Identify arbitrage opportunities from processed matches (2-way and 3-way).
-        Uses validated stakes that survive rounding.
+        Uses comprehensive validation: scenario simulation, partition validation, and stake validation.
 
         Args:
             matches: List of processed match dictionaries
@@ -383,6 +423,9 @@ class ArbitrageFinder:
             List of arbitrage opportunities with verified profit calculations
         """
         opportunities = []
+        validator = ArbitrageValidator()
+        stake_validator = StakeValidator()
+        partition_validator = OutcomePartition()
 
         for match in matches:
             num_outcomes = match.get('num_outcomes', 2)
@@ -391,37 +434,115 @@ class ArbitrageFinder:
                 # 2-way arbitrage (combat sports, totals, spreads)
                 odds_a = match['odds_a']
                 odds_b = match['odds_b']
+                sport = match.get('sport', 'Unknown')
 
                 # Calculate profit margin
                 profit_margin = calculate_arbitrage_profit(odds_a, odds_b)
 
                 # Check if meets minimum threshold
                 if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
-                    # Calculate and validate stakes (handles rounding)
+                    # Calculate initial stakes
                     stakes_result = calculate_stakes_with_validation(
                         odds_a, odds_b, config.DEFAULT_STAKE
                     )
 
                     if stakes_result is None:
-                        # Arbitrage is broken by rounding, skip this opportunity
                         continue
 
                     stake_a, stake_b = stakes_result
 
-                    # Calculate guaranteed profit
-                    guaranteed_profit = calculate_guaranteed_profit(
-                        odds_a, odds_b, stake_a, stake_b
+                    # FIXED: Validate and adjust stakes to preserve $100 total
+                    is_valid, adj_stake_a, adj_stake_b, stake_reason = stake_validator.validate_and_adjust_stakes(
+                        odds_a, odds_b, stake_a, stake_b, config.DEFAULT_STAKE
                     )
+
+                    if not is_valid:
+                        continue
+
+                    # Build outcome dicts for validation
+                    # Map string outcome to OutcomeType enum or keep as string for combat sports
+                    player_a_str = str(match['player_a'])
+                    player_b_str = str(match['player_b'])
+                    
+                    # For combat sports (MMA/boxing), map HOME/AWAY to A_WINS/B_WINS
+                    # For team sports, use OutcomeType enum or keep as string
+                    is_combat_sport = 'mma' in sport.lower() or 'boxing' in sport.lower()
+                    
+                    if is_combat_sport:
+                        # Map HOME -> A_WINS, AWAY -> B_WINS for combat sports
+                        # For combat sports, HOME/AWAY represent player A/B respectively
+                        # player_a is typically HOME (player A), player_b is typically AWAY (player B)
+                        player_a_upper = player_a_str.upper()
+                        player_b_upper = player_b_str.upper()
+                        
+                        # Map player_a to A_WINS (HOME = player A wins)
+                        if player_a_upper in ["HOME", "A_WINS"]:
+                            outcome_a_type = "A_WINS"
+                        elif player_a_upper in ["AWAY", "B_WINS"]:
+                            outcome_a_type = "B_WINS"
+                        else:
+                            # Default: player_a is player A (first fighter)
+                            outcome_a_type = "A_WINS"
+                        
+                        # Map player_b to B_WINS (AWAY = player B wins)
+                        if player_b_upper in ["AWAY", "B_WINS"]:
+                            outcome_b_type = "B_WINS"
+                        elif player_b_upper in ["HOME", "A_WINS"]:
+                            outcome_b_type = "A_WINS"
+                        else:
+                            # Default: player_b is player B (second fighter)
+                            outcome_b_type = "B_WINS"
+                    else:
+                        # For team sports, try to map to OutcomeType enum
+                        player_a_upper = player_a_str.upper()
+                        player_b_upper = player_b_str.upper()
+                        
+                        if player_a_upper == "HOME":
+                            outcome_a_type = OutcomeType.HOME_WIN
+                        elif player_a_upper == "AWAY":
+                            outcome_a_type = OutcomeType.AWAY_WIN
+                        else:
+                            outcome_a_type = player_a_str
+                            
+                        if player_b_upper == "HOME":
+                            outcome_b_type = OutcomeType.HOME_WIN
+                        elif player_b_upper == "AWAY":
+                            outcome_b_type = OutcomeType.AWAY_WIN
+                        else:
+                            outcome_b_type = player_b_str
+
+                    outcome_a = {
+                        'outcome_type': outcome_a_type,
+                        'spread': match.get('point_a'),
+                        'total': None
+                    }
+                    outcome_b = {
+                        'outcome_type': outcome_b_type,
+                        'spread': match.get('point_b'),
+                        'total': None
+                    }
+
+                    # FIXED: Scenario validate the opportunity
+                    is_arb_valid, validation_reason, validation_results = validator.validate_two_way_arbitrage(
+                        outcome_a, outcome_b, adj_stake_a, adj_stake_b,
+                        odds_a, odds_b, sport
+                    )
+
+                    if not is_arb_valid:
+                        continue
+
+                    guaranteed_profit = validation_results['profit_range'][0]
 
                     # Create opportunity dict
                     opportunity = {
                         **match,
                         'profit_margin': profit_margin,
-                        'stake_a': stake_a,
-                        'stake_b': stake_b,
+                        'stake_a': adj_stake_a,
+                        'stake_b': adj_stake_b,
                         'guaranteed_profit': guaranteed_profit,
                         'total_stake': config.DEFAULT_STAKE,
-                        'is_rounded': True  # Flag that stakes were validated after rounding
+                        'is_validated': True,
+                        'validation_reason': validation_reason
                     }
 
                     opportunities.append(opportunity)
@@ -431,50 +552,71 @@ class ArbitrageFinder:
                 odds_a = match['odds_a']
                 odds_draw = match['odds_draw']
                 odds_b = match['odds_b']
+                sport = match.get('sport', 'Unknown')
 
                 # Calculate profit margin
                 profit_margin = calculate_three_way_arbitrage(odds_a, odds_draw, odds_b)
 
                 # Check if meets minimum threshold
                 if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
-                    # For 3-way, calculate stakes the traditional way then verify
+                    # Calculate initial stakes
                     denominator = (1 / odds_a) + (1 / odds_draw) + (1 / odds_b)
                     stake_a_ideal = config.DEFAULT_STAKE * (1 / odds_a) / denominator
                     stake_draw_ideal = config.DEFAULT_STAKE * (1 / odds_draw) / denominator
                     stake_b_ideal = config.DEFAULT_STAKE * (1 / odds_b) / denominator
 
-                    # Round to cents
                     stake_a = round(stake_a_ideal, 2)
                     stake_draw = round(stake_draw_ideal, 2)
                     stake_b = round(config.DEFAULT_STAKE - stake_a - stake_draw, 2)
 
-                    # Verify returns are equal within tolerance
-                    return_a = stake_a * odds_a
-                    return_draw = stake_draw * odds_draw
-                    return_b = stake_b * odds_b
+                    # FIXED: Validate and adjust stakes for 3-way
+                    is_valid, adj_stake_a, adj_stake_draw, adj_stake_b, stake_reason = stake_validator.validate_three_way_stakes(
+                        odds_a, odds_draw, odds_b, stake_a, stake_draw, stake_b, config.DEFAULT_STAKE
+                    )
 
-                    max_return = max(return_a, return_draw, return_b)
-                    min_return = min(return_a, return_draw, return_b)
-
-                    if max_return - min_return > 0.01:
-                        # Rounding broke the arbitrage, skip
+                    if not is_valid:
                         continue
 
-                    # Calculate guaranteed profit
-                    guaranteed_profit = calculate_three_way_profit(
-                        odds_a, odds_draw, odds_b, stake_a, stake_draw, stake_b
+                    # Build outcome dicts for validation
+                    outcome_a = {
+                        'outcome_type': OutcomeType.HOME_WIN,
+                        'spread': None,
+                        'total': None
+                    }
+                    outcome_draw = {
+                        'outcome_type': OutcomeType.DRAW,
+                        'spread': None,
+                        'total': None
+                    }
+                    outcome_b = {
+                        'outcome_type': OutcomeType.AWAY_WIN,
+                        'spread': None,
+                        'total': None
+                    }
+
+                    # FIXED: Scenario validate 3-way opportunity
+                    is_arb_valid, validation_reason, validation_results = validator.validate_three_way_arbitrage(
+                        outcome_a, outcome_draw, outcome_b,
+                        adj_stake_a, adj_stake_draw, adj_stake_b,
+                        odds_a, odds_draw, odds_b, sport
                     )
+
+                    if not is_arb_valid:
+                        continue
+
+                    guaranteed_profit = validation_results['profit_range'][0]
 
                     # Create opportunity dict
                     opportunity = {
                         **match,
                         'profit_margin': profit_margin,
-                        'stake_a': stake_a,
-                        'stake_draw': stake_draw,
-                        'stake_b': stake_b,
+                        'stake_a': adj_stake_a,
+                        'stake_draw': adj_stake_draw,
+                        'stake_b': adj_stake_b,
                         'guaranteed_profit': guaranteed_profit,
                         'total_stake': config.DEFAULT_STAKE,
-                        'is_rounded': True
+                        'is_validated': True,
+                        'validation_reason': validation_reason
                     }
 
                     opportunities.append(opportunity)
@@ -500,46 +642,65 @@ class ArbitrageFinder:
     
     def passes_filters(self, opportunity: Dict) -> tuple:
         """
-        Check if opportunity passes all smart filters.
-        
+        Check if opportunity passes all smart filters including real-world constraints.
+
         Args:
             opportunity: Opportunity dictionary
-        
+
         Returns:
             Tuple of (passes: bool, reason: str)
         """
+        # Check if opportunity has been validated
+        if not opportunity.get('is_validated', False):
+            return (False, "Opportunity failed mathematical validation (not scenario-verified)")
+
         # Check bookmaker trust scores
         bookmakers = [opportunity['bookmaker_a'], opportunity['bookmaker_b']]
         if opportunity.get('num_outcomes') == 3:
             bookmakers.append(opportunity['bookmaker_draw'])
-        
+
         for bookmaker in bookmakers:
-            trust_score = config.BOOKMAKER_TRUST_SCORES.get(bookmaker, 5)  # Default 5 if unknown
+            trust_score = config.BOOKMAKER_TRUST_SCORES.get(bookmaker, 5)
             if trust_score < config.MINIMUM_BOOKMAKER_TRUST:
                 return (False, f"Bookmaker {bookmaker} trust score ({trust_score}) below minimum ({config.MINIMUM_BOOKMAKER_TRUST})")
-        
+
         # Check event timing
         try:
             event_time = datetime.fromisoformat(opportunity['commence_time'].replace('Z', '+00:00'))
             current_time = datetime.now(event_time.tzinfo)
             time_until_event = (event_time - current_time).total_seconds() / 3600  # Hours
-            
+
             if time_until_event < config.MINIMUM_EVENT_START_HOURS:
-                return (False, f"Event starts in {time_until_event:.1f} hours (minimum: {config.MINIMUM_EVENT_START_HOURS})")
-            
+                return (False, f"Event starts in {time_until_event:.1f} hours (minimum: {config.MINIMUM_EVENT_START_HOURS}h)")
+
             if time_until_event > (config.MAXIMUM_EVENT_START_DAYS * 24):
                 return (False, f"Event too far in future ({time_until_event/24:.1f} days)")
         except Exception as e:
-            # If we can't parse time, allow it through
             pass
-        
+
         # Check sport-specific profit threshold
         sport = opportunity['sport']
         min_profit = config.SPORT_PROFIT_THRESHOLDS.get(sport, config.MINIMUM_PROFIT_THRESHOLD)
         if opportunity['profit_margin'] < min_profit:
             return (False, f"Profit {opportunity['profit_margin']:.2f}% below sport minimum {min_profit}%")
-        
-        return (True, "All filters passed")
+
+        # ADDED: Check real-world constraints
+        real_world_validator = RealWorldValidator()
+        is_valid_realworld, primary_reason, constraint_results = real_world_validator.validate_opportunity(opportunity)
+
+        if not is_valid_realworld:
+            return (False, f"Real-world constraint failed: {primary_reason}")
+
+        # ADDED: Verify stake totals are exact
+        if opportunity.get('num_outcomes') == 2:
+            total_stake = opportunity['stake_a'] + opportunity['stake_b']
+        else:
+            total_stake = opportunity['stake_a'] + opportunity.get('stake_draw', 0) + opportunity['stake_b']
+
+        if abs(total_stake - config.DEFAULT_STAKE) > 0.01:
+            return (False, f"Stake total ${total_stake:.2f} doesn't equal ${config.DEFAULT_STAKE:.2f}")
+
+        return (True, "All filters and validations passed")
     
     def should_alert(self, opportunity: Dict) -> bool:
         """
@@ -575,6 +736,197 @@ class ArbitrageFinder:
             del self.recent_alerts[key]
         
         return True
+    
+    def calculate_opportunity_score(self, opportunity: Dict) -> float:
+        """
+        Calculate composite score for ranking opportunities.
+        
+        Args:
+            opportunity: Opportunity dictionary
+            
+        Returns:
+            Composite score (higher is better)
+        """
+        profit_margin = opportunity.get('profit_margin', 0.0)
+        guaranteed_profit = opportunity.get('guaranteed_profit', 0.0)
+        
+        # Get confidence score
+        market_type = opportunity.get('market', 'h2h')
+        odds_rank_a = opportunity.get('odds_rank_a', 0)
+        odds_rank_b = opportunity.get('odds_rank_b', 0)
+        odds_rank_draw = opportunity.get('odds_rank_draw', 0)
+        
+        confidence, _ = calculate_market_confidence(
+            market_type,
+            odds_rank_a=odds_rank_a,
+            odds_rank_b=odds_rank_b,
+            odds_rank_draw=odds_rank_draw
+        )
+        
+        # Normalize profit to percentage (it's already in %)
+        normalized_profit = guaranteed_profit / config.DEFAULT_STAKE * 100
+        
+        # Composite score: profit_margin (60%), confidence (30%), normalized_profit (10%)
+        score = (profit_margin * 0.6) + (confidence * 0.3) + (normalized_profit * 0.1)
+        
+        return score
+    
+    def display_top_opportunities(self, opportunities: List[Dict], cycle_num: int):
+        """
+        Display top opportunities with detailed betting information.
+
+        Args:
+            opportunities: List of opportunity dictionaries (already ranked)
+            cycle_num: Cycle number for display
+        """
+        if not opportunities:
+            return
+
+        # ANSI color codes
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        RED = '\033[91m'
+        CYAN = '\033[96m'
+        BOLD = '\033[1m'
+        RESET = '\033[0m'
+
+        print("\n" + "=" * 140)
+        print(f"{BOLD}TOP {min(len(opportunities), config.TOP_OPPORTUNITIES_COUNT)} OPPORTUNITIES - Cycle #{cycle_num}{RESET}")
+        print("=" * 140)
+
+        # Quick reference table
+        print(f"{BOLD}QUICK REFERENCE:{RESET}")
+        print(f"{BOLD}{'Rank':<6} {'Event':<25} {'Sport':<18} {'Profit %':<10} {'Confidence':<15} {'Guaranteed':<12} {'Event Time':<20}{RESET}")
+        print("-" * 140)
+
+        # Display top opportunities summary
+        for i, opp in enumerate(opportunities[:config.TOP_OPPORTUNITIES_COUNT], 1):
+            # Get event name
+            event_name = opp.get('event_name', f"{opp.get('player_a', 'Unknown')} vs {opp.get('player_b', 'Unknown')}")
+            if len(event_name) > 24:
+                event_name = event_name[:21] + "..."
+
+            # Get sport name
+            sport_name = get_sport_display_name(opp.get('sport', 'Unknown'))
+            if len(sport_name) > 17:
+                sport_name = sport_name[:14] + "..."
+
+            # Get profit margin
+            profit_margin = opp.get('profit_margin', 0.0)
+            profit_str = f"{profit_margin:.2f}%"
+
+            # Get confidence
+            market_type = opp.get('market', 'h2h')
+            odds_rank_a = opp.get('odds_rank_a', 0)
+            odds_rank_b = opp.get('odds_rank_b', 0)
+            odds_rank_draw = opp.get('odds_rank_draw', 0)
+
+            confidence, confidence_label = calculate_market_confidence(
+                market_type,
+                odds_rank_a=odds_rank_a,
+                odds_rank_b=odds_rank_b,
+                odds_rank_draw=odds_rank_draw
+            )
+
+            # Color code confidence
+            if confidence_label == "HIGH":
+                conf_color = GREEN
+            elif confidence_label == "MEDIUM":
+                conf_color = YELLOW
+            else:
+                conf_color = RED
+
+            # Format confidence string
+            confidence_str = f"{conf_color}{confidence_label}{RESET} ({confidence:.0f}%)"
+
+            # Get guaranteed profit
+            guaranteed_profit = opp.get('guaranteed_profit', 0.0)
+            profit_dollar_str = format_currency(guaranteed_profit)
+
+            # Get event time
+            try:
+                event_time_str = format_timestamp(opp.get('commence_time', ''))
+            except:
+                event_time_str = "N/A"
+
+            # Print summary row
+            print(f"  {i:<4} {event_name:<25} {sport_name:<18} {profit_str:<10} {confidence_str:<25} {profit_dollar_str:<12} {event_time_str:<20}")
+
+        print("-" * 140)
+
+        # Detailed betting information for each opportunity
+        print(f"\n{BOLD}DETAILED BETTING INFORMATION:{RESET}\n")
+
+        for i, opp in enumerate(opportunities[:config.TOP_OPPORTUNITIES_COUNT], 1):
+            # Get event information
+            event_name = opp.get('event_name', f"{opp.get('player_a', 'Unknown')} vs {opp.get('player_b', 'Unknown')}")
+            sport_name = get_sport_display_name(opp.get('sport', 'Unknown'))
+            commence_time = format_timestamp(opp.get('commence_time', ''))
+
+            # Get bet details
+            player_a = opp.get('player_a', 'Unknown')
+            player_b = opp.get('player_b', 'Unknown')
+            odds_a = opp.get('odds_a', 0.0)
+            odds_b = opp.get('odds_b', 0.0)
+            stake_a = opp.get('stake_a', 0.0)
+            stake_b = opp.get('stake_b', 0.0)
+            bookmaker_a = opp.get('bookmaker_a', 'Unknown')
+            bookmaker_b = opp.get('bookmaker_b', 'Unknown')
+            guaranteed_profit = opp.get('guaranteed_profit', 0.0)
+            profit_margin = opp.get('profit_margin', 0.0)
+            total_stake = opp.get('total_stake', 100.0)
+
+            # Get confidence
+            market_type = opp.get('market', 'h2h')
+            odds_rank_a = opp.get('odds_rank_a', 0)
+            odds_rank_b = opp.get('odds_rank_b', 0)
+            odds_rank_draw = opp.get('odds_rank_draw', 0)
+
+            confidence, confidence_label = calculate_market_confidence(
+                market_type,
+                odds_rank_a=odds_rank_a,
+                odds_rank_b=odds_rank_b,
+                odds_rank_draw=odds_rank_draw
+            )
+
+            # Color code confidence
+            if confidence_label == "HIGH":
+                conf_color = GREEN
+            elif confidence_label == "MEDIUM":
+                conf_color = YELLOW
+            else:
+                conf_color = RED
+
+            # Print detailed information
+            print(f"{CYAN}╔{'═' * 136}╗{RESET}")
+            print(f"{CYAN}║{RESET} {BOLD}Opportunity #{i}: {event_name}{RESET}")
+            print(f"{CYAN}║{RESET} {BOLD}Sport:{RESET} {sport_name} | {BOLD}Event Time:{RESET} {commence_time}")
+            print(f"{CYAN}║{RESET} {BOLD}Profit:{RESET} {profit_margin:.2f}% | {BOLD}Guaranteed Return:{RESET} {format_currency(guaranteed_profit)} | {BOLD}Confidence:{RESET} {conf_color}{confidence_label}{RESET} ({confidence:.0f}%)")
+            print(f"{CYAN}╠{'═' * 136}╣{RESET}")
+
+            # Bet 1 information
+            return_a = stake_a * odds_a
+            print(f"{CYAN}║{RESET} {BOLD}BET 1 - {player_a}:{RESET}")
+            print(f"{CYAN}║{RESET}   {BOLD}Bookmaker:{RESET} {bookmaker_a:<20} {BOLD}Odds:{RESET} {odds_a:.2f}")
+            print(f"{CYAN}║{RESET}   {BOLD}Stake:{RESET} {format_currency(stake_a):<15} {BOLD}If Wins, Returns:{RESET} {format_currency(return_a)}")
+
+            # Bet 2 information
+            return_b = stake_b * odds_b
+            print(f"{CYAN}║{RESET} {BOLD}BET 2 - {player_b}:{RESET}")
+            print(f"{CYAN}║{RESET}   {BOLD}Bookmaker:{RESET} {bookmaker_b:<20} {BOLD}Odds:{RESET} {odds_b:.2f}")
+            print(f"{CYAN}║{RESET}   {BOLD}Stake:{RESET} {format_currency(stake_b):<15} {BOLD}If Wins, Returns:{RESET} {format_currency(return_b)}")
+
+            print(f"{CYAN}╠{'═' * 136}╣{RESET}")
+            print(f"{CYAN}║{RESET} {BOLD}SUMMARY:{RESET}")
+            print(f"{CYAN}║{RESET}   {BOLD}Total Investment:{RESET} {format_currency(total_stake)}")
+            print(f"{CYAN}║{RESET}   {BOLD}Minimum Return (Guaranteed):{RESET} {format_currency(min(return_a, return_b))}")
+            print(f"{CYAN}║{RESET}   {BOLD}Guaranteed Profit:{RESET} {GREEN}{format_currency(guaranteed_profit)}{RESET}")
+            print(f"{CYAN}║{RESET}   {BOLD}Return on Investment:{RESET} {GREEN}{(guaranteed_profit/total_stake)*100:.1f}%{RESET}")
+            print(f"{CYAN}╚{'═' * 136}╝{RESET}")
+            print()
+
+        print("=" * 140)
+        print()
     
     def display_alert(self, opportunity: Dict):
         """
@@ -616,6 +968,7 @@ class ArbitrageFinder:
         odds_rank_b = opportunity.get('odds_rank_b', 0)
         odds_rank_draw = opportunity.get('odds_rank_draw', 0)
         is_cross_market = opportunity.get('is_cross_market', False)
+        is_validated = opportunity.get('is_validated', False)
 
         confidence, confidence_label = calculate_market_confidence(
             market_type,
@@ -626,6 +979,15 @@ class ArbitrageFinder:
 
         confidence_color = GREEN if confidence_label == "HIGH" else YELLOW if confidence_label == "MEDIUM" else '\033[91m'
         print(f"Confidence: {confidence_color}{confidence_label}{RESET} ({confidence:.0f}%)")
+
+        # ADDED: Show validation status
+        if is_validated:
+            validation_notes = opportunity.get('validation_reason', 'Scenario validated')
+            print(f"{GREEN}✓ MATHEMATICALLY VERIFIED (Scenario Simulation){RESET}")
+            print(f"{CYAN}Validation: {validation_notes}{RESET}")
+        else:
+            RED = '\033[91m'
+            print(f"{RED}✗ NOT VALIDATED{RESET}")
 
         if is_cross_market:
             print(f"{CYAN}[CROSS-MARKET ARBITRAGE]{RESET}")
@@ -699,9 +1061,13 @@ class ArbitrageFinder:
         """
         Main function to check for arbitrage opportunities.
         Fetches odds, processes them (including cross-market), and alerts on opportunities.
+        After each cycle, displays top 5 most profitable/confident opportunities.
         """
+        self.cycle_number += 1
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f"\n[{current_time}] Checking for arbitrage opportunities...")
+        print(f"\n{'=' * 100}")
+        print(f"[{current_time}] Cycle #{self.cycle_number} - Checking for arbitrage opportunities...")
+        print(f"{'=' * 100}")
 
         all_opportunities = []
         cross_market_count = 0
@@ -741,9 +1107,12 @@ class ArbitrageFinder:
             else:
                 print(f"[{sport}] Failed to fetch odds")
 
-        # Display alerts for new opportunities that pass filters
+        # Collect all opportunities that pass filters and should alert
+        valid_opportunities = []
         new_opportunities = 0
         filtered_count = 0
+        duplicate_count = 0
+        
         for opp in all_opportunities:
             # Log to database if enabled
             opportunity_id = None
@@ -758,29 +1127,48 @@ class ArbitrageFinder:
 
             # Check if not a duplicate
             if self.should_alert(opp):
-                self.display_alert(opp)
+                # Calculate score for ranking
+                score = self.calculate_opportunity_score(opp)
+                opp['_score'] = score  # Store score temporarily
+                valid_opportunities.append(opp)
                 new_opportunities += 1
+
+                # Display individual alert if enabled
+                if config.SHOW_INDIVIDUAL_ALERTS:
+                    self.display_alert(opp)
 
                 # Log alert to database
                 if self.db and opportunity_id:
                     self.db.log_alert(opportunity_id)
-
-        if filtered_count > 0:
-            print(f"[INFO] Filtered out {filtered_count} opportunities (trust/timing/profit threshold)")
-
-        if cross_market_count > 0:
-            print(f"[INFO] Cross-market opportunities detected: {cross_market_count}")
-
-        if new_opportunities == 0 and len(all_opportunities) > 0:
-            remaining = len(all_opportunities) - filtered_count
-            if remaining > 0:
-                print(f"[INFO] Found {remaining} opportunities, but all were recent duplicates")
             else:
-                print("[INFO] No arbitrage opportunities found in this check")
-        elif new_opportunities == 0:
-            print("[INFO] No arbitrage opportunities found in this check")
+                duplicate_count += 1
 
-        print(f"[INFO] Total API calls made: {self.api_call_count}")
+        # Display summary statistics
+        print(f"\n{'─' * 100}")
+        print(f"Cycle #{self.cycle_number} Summary:")
+        print(f"  • Total opportunities found: {len(all_opportunities)}")
+        print(f"  • Filtered out: {filtered_count} (trust/timing/profit threshold)")
+        print(f"  • Duplicates skipped: {duplicate_count}")
+        print(f"  • New opportunities: {new_opportunities}")
+        if cross_market_count > 0:
+            print(f"  • Cross-market opportunities: {cross_market_count}")
+        print(f"  • API calls made: {self.api_call_count}")
+        print(f"{'─' * 100}")
+
+        # Rank and display top opportunities
+        if valid_opportunities:
+            # Sort by score (descending)
+            valid_opportunities.sort(key=lambda x: x.get('_score', 0), reverse=True)
+            
+            # Display top opportunities table
+            self.display_top_opportunities(valid_opportunities, self.cycle_number)
+            
+            # Clean up temporary score field
+            for opp in valid_opportunities:
+                opp.pop('_score', None)
+        else:
+            print("\n[INFO] No new arbitrage opportunities found in this cycle.")
+            print()
 
 
 def main():
