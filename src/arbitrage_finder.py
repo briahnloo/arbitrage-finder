@@ -923,17 +923,40 @@ class ArbitrageFinder:
             print(f"{CYAN}║{RESET} {BOLD}Profit:{RESET} {profit_margin:.2f}% | {BOLD}Guaranteed Return:{RESET} {format_currency(guaranteed_profit)} | {BOLD}Confidence:{RESET} {conf_color}{confidence_label}{RESET} ({confidence:.0f}%)")
             print(f"{CYAN}╠{'═' * 136}╣{RESET}")
 
+            # Check if 3-way (with draw)
+            num_outcomes = opp.get('num_outcomes', 2)
+            
             # Bet 1 information
             return_a = stake_a * odds_a
             print(f"{CYAN}║{RESET} {BOLD}BET 1 - {player_a}:{RESET}")
             print(f"{CYAN}║{RESET}   {BOLD}Bookmaker:{RESET} {bookmaker_a:<20} {BOLD}Odds:{RESET} {odds_a:.2f}")
             print(f"{CYAN}║{RESET}   {BOLD}Stake:{RESET} {format_currency(stake_a):<15} {BOLD}If Wins, Returns:{RESET} {format_currency(return_a)}")
 
-            # Bet 2 information
+            # Bet 2 (Draw for 3-way, or Away for 2-way)
             return_b = stake_b * odds_b
-            print(f"{CYAN}║{RESET} {BOLD}BET 2 - {player_b}:{RESET}")
-            print(f"{CYAN}║{RESET}   {BOLD}Bookmaker:{RESET} {bookmaker_b:<20} {BOLD}Odds:{RESET} {odds_b:.2f}")
-            print(f"{CYAN}║{RESET}   {BOLD}Stake:{RESET} {format_currency(stake_b):<15} {BOLD}If Wins, Returns:{RESET} {format_currency(return_b)}")
+            if num_outcomes == 3:
+                player_draw = opp.get('player_draw', 'DRAW')
+                bookmaker_draw = opp.get('bookmaker_draw', opp.get('bookmaker_b', 'Unknown'))
+                odds_draw = opp.get('odds_draw', odds_b)
+                stake_draw = opp.get('stake_draw', stake_b)
+                return_draw = stake_draw * odds_draw
+                
+                print(f"{CYAN}║{RESET} {BOLD}BET 2 - {player_draw}:{RESET}")
+                print(f"{CYAN}║{RESET}   {BOLD}Bookmaker:{RESET} {bookmaker_draw:<20} {BOLD}Odds:{RESET} {odds_draw:.2f}")
+                print(f"{CYAN}║{RESET}   {BOLD}Stake:{RESET} {format_currency(stake_draw):<15} {BOLD}If Wins, Returns:{RESET} {format_currency(return_draw)}")
+                
+                # Bet 3 (Away for 3-way)
+                stake_c = opp.get('stake_b', 0.0)
+                odds_c = opp.get('odds_b', 0.0)
+                return_c = stake_c * odds_c
+                print(f"{CYAN}║{RESET} {BOLD}BET 3 - {player_b}:{RESET}")
+                print(f"{CYAN}║{RESET}   {BOLD}Bookmaker:{RESET} {bookmaker_b:<20} {BOLD}Odds:{RESET} {odds_c:.2f}")
+                print(f"{CYAN}║{RESET}   {BOLD}Stake:{RESET} {format_currency(stake_c):<15} {BOLD}If Wins, Returns:{RESET} {format_currency(return_c)}")
+            else:
+                # 2-way bet
+                print(f"{CYAN}║{RESET} {BOLD}BET 2 - {player_b}:{RESET}")
+                print(f"{CYAN}║{RESET}   {BOLD}Bookmaker:{RESET} {bookmaker_b:<20} {BOLD}Odds:{RESET} {odds_b:.2f}")
+                print(f"{CYAN}║{RESET}   {BOLD}Stake:{RESET} {format_currency(stake_b):<15} {BOLD}If Wins, Returns:{RESET} {format_currency(return_b)}")
 
             print(f"{CYAN}╠{'═' * 136}╣{RESET}")
             print(f"{CYAN}║{RESET} {BOLD}SUMMARY:{RESET}")
