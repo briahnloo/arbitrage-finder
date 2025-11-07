@@ -6,7 +6,7 @@ Provides functions to analyze historical data from the database.
 import sqlite3
 from typing import Dict, List, Tuple
 from collections import defaultdict
-import config
+from src import config
 
 
 def get_summary_stats() -> Dict:

@@ -7,7 +7,7 @@ import discord
 import logging
 from typing import Dict, Optional, List
 from datetime import datetime
-from utils import format_currency, format_timestamp, get_sport_display_name
+from src.utils import format_currency, format_timestamp, get_sport_display_name
 
 logger = logging.getLogger(__name__)
 

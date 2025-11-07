@@ -10,10 +10,10 @@ from datetime import datetime
 import discord
 from discord.ext import commands, tasks
 
-from discord_notifier import DiscordNotifier
-from subscription_manager import SubscriptionManager
-from user_manager import UserManager
-from arbitrage_finder import ArbitrageFinder
+from discord.discord_notifier import DiscordNotifier
+from discord.subscription_manager import SubscriptionManager
+from discord.user_manager import UserManager
+from src.arbitrage_finder import ArbitrageFinder
 
 logger = logging.getLogger(__name__)
 

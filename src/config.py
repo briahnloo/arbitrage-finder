@@ -45,9 +45,9 @@ SPORT_ROTATION = [
 
 # API Parameters
 API_REGIONS = 'us'  # US sportsbooks
-API_MARKETS = 'h2h'  # OPTIMIZED: Only moneyline (h2h) - 92% less API usage
-# Original was 'h2h,totals,spreads' = 3 credits per request
-# Now 'h2h' = 1 credit per request (most arbitrage is in H2H anyway)
+API_MARKETS = 'h2h,spreads,totals'  # All markets for maximum arbitrage detection
+# Includes: moneyline (h2h), point spreads, and totals (over/under)
+# 3 credits per request but finds more arbitrage opportunities across all market types
 ODDS_FORMAT = 'decimal'  # Decimal odds format for easier calculations
 
 # Market type display names
@@ -58,7 +58,9 @@ MARKET_DISPLAY_NAMES = {
 }
 
 # System Configuration
-MINIMUM_PROFIT_THRESHOLD = 1.0  # Minimum profit percentage to trigger alert (1.0%)
+MINIMUM_PROFIT_THRESHOLD = 0.5  # Minimum profit percentage to trigger alert (0.5%)
+# Lowered from 1.0% to catch more arbitrage opportunities
+# Still provides safety margin for execution risk
 DEFAULT_STAKE = 100  # Default total investment amount in dollars ($100)
 
 # Output Configuration

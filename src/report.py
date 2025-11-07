@@ -16,9 +16,9 @@ Commands:
 import sys
 import csv
 from pathlib import Path
-import analytics
-import config
-from utils import format_currency, get_sport_display_name
+from src import analytics
+from src import config
+from src.utils import format_currency, get_sport_display_name
 
 
 def print_header(title: str):

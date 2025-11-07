@@ -202,9 +202,10 @@ class ArbitrageFinder:
                     outcome_a_list = outcome_odds[outcome_a_key]
                     outcome_b_list = outcome_odds[outcome_b_key]
 
-                    # Generate opportunities for top 3 combinations
-                    for i, odds_a_option in enumerate(outcome_a_list[:3]):
-                        for j, odds_b_option in enumerate(outcome_b_list[:3]):
+                    # Generate opportunities for top 5 combinations (expanded from top 3)
+                    # Testing more odds combinations increases chance of finding arbitrage
+                    for i, odds_a_option in enumerate(outcome_a_list[:5]):
+                        for j, odds_b_option in enumerate(outcome_b_list[:5]):
                             processed_matches.append({
                                 'sport': sport,
                                 'market': market_key,
@@ -235,10 +236,11 @@ class ArbitrageFinder:
                         away_list = outcome_odds[away_outcome]
                         draw_list = outcome_odds[draw_outcome]
 
-                        # Generate opportunities for top 3 combinations
-                        for i, odds_home in enumerate(home_list[:3]):
-                            for j, odds_draw in enumerate(draw_list[:3]):
-                                for k, odds_away in enumerate(away_list[:3]):
+                        # Generate opportunities for top 5 combinations (expanded from top 3)
+                        # 3-way soccer/hockey: testing more combinations = more arbitrage detection
+                        for i, odds_home in enumerate(home_list[:5]):
+                            for j, odds_draw in enumerate(draw_list[:5]):
+                                for k, odds_away in enumerate(away_list[:5]):
                                     processed_matches.append({
                                         'sport': sport,
                                         'market': market_key,

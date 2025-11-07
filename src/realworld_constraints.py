@@ -5,7 +5,7 @@ Accounts for practical limitations that affect arbitrage viability.
 
 from datetime import datetime, timedelta
 from typing import Tuple, Dict, Optional
-import config
+from src import config
 
 
 class TimingConstraints:
