@@ -13,6 +13,8 @@ import logging
 
 # Set up logging
 logger = logging.getLogger(__name__)
+# Enable debug logging to see diagnostic messages
+logging.basicConfig(level=logging.DEBUG, format='%(message)s')
 
 from src import config
 from src.utils import (
@@ -23,6 +25,8 @@ from src.utils import (
     calculate_guaranteed_profit,
     calculate_three_way_arbitrage,
     calculate_three_way_stakes,
+    calculate_three_way_stakes_balanced,
+    verify_arbitrage_with_rounding,
     calculate_three_way_profit,
     get_sport_display_name,
     normalize_team_name,
@@ -63,55 +67,83 @@ class ArbitrageFinder:
     def fetch_odds(self, sport: str) -> Optional[Dict]:
         """
         Fetch odds data from The Odds API for a specific sport.
-        
+
         Args:
             sport: Sport key (e.g., 'tennis_atp')
-        
+
         Returns:
             JSON response dict or None if error occurs
         """
         url = f"{config.BASE_API_URL}/sports/{sport}/odds/"
-        
+
         params = {
             'apiKey': config.ODDS_API_KEY,
             'regions': config.API_REGIONS,
             'markets': config.API_MARKETS,
             'oddsFormat': config.ODDS_FORMAT
         }
-        
+
         try:
             self.api_call_count += 1
             self.last_api_call_time = datetime.now()
-            
+
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
-            
-            # Check remaining API quota
+
+            # Check remaining API quota (Issue 1.6)
             remaining = response.headers.get('x-requests-remaining')
             if remaining:
+                remaining_int = int(remaining)
                 print(f"[API] Remaining requests: {remaining}")
-            
-            return response.json()
-            
+                # Warn if quota is critically low
+                if remaining_int < 50:
+                    logger.warning(f"[API] Critical: Only {remaining_int} requests remaining!")
+
+            data = response.json()
+
+            # Validate data freshness only when the payload is a dict (avoid calling .get on lists)
+            if isinstance(data, dict):
+                last_update_str = data.get('last_update')
+                if last_update_str:
+                    try:
+                        last_update = datetime.fromisoformat(last_update_str.replace('Z', '+00:00'))
+                        age_seconds = (datetime.now(last_update.tzinfo) - last_update).total_seconds()
+
+                        # Reject stale odds (more than 30 seconds old)
+                        if age_seconds > 30:
+                            logger.warning(f"[{sport}] Stale odds data: {age_seconds:.1f}s old (threshold: 30s)")
+                            return None
+
+                        # Store freshness info in data for later logging
+                        data['_freshness_seconds'] = age_seconds
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"[{sport}] Could not parse last_update timestamp: {e}")
+
+            return data
+
         except requests.exceptions.RequestException as e:
             print(f"[ERROR] Failed to fetch odds for {sport}: {e}")
+            logger.error(f"[{sport}] API request failed: {e}")
             return None
     
     def process_odds(self, odds_data: List[Dict], sport: str) -> List[Dict]:
         """
-        Process odds data with improved outcome normalization and top 3 odds tracking.
+        Process odds data with improved outcome normalization and exhaustive odds tracking.
 
         Args:
             odds_data: List of match data from API
             sport: Sport key for display purposes
 
         Returns:
-            List of processed match dictionaries with top odds per market type
+            List of processed match dictionaries with all odds combinations per market type
         """
         processed_matches = []
+        skipped_matches = 0
 
         for match in odds_data:
             if not match.get('bookmakers'):
+                logger.debug(f"[{sport}] Skipped match with no bookmakers")
+                skipped_matches += 1
                 continue
 
             # Extract match info
@@ -137,9 +169,14 @@ class ArbitrageFinder:
 
                     for outcome in market.get('outcomes', []):
                         odds = outcome.get('price')
+                        outcome_name = outcome.get('name', 'UNKNOWN')
 
                         # Skip invalid odds
-                        if not odds or odds < 1.0 or odds > 1000:
+                        if not odds:
+                            logger.debug(f"[{sport}] No odds for outcome {outcome_name} in {market_key}")
+                            continue
+                        if odds < 1.0 or odds > 1000:
+                            logger.debug(f"[{sport}] Out-of-range odds {odds} for {outcome_name} ({market_key})")
                             continue
 
                         # Create canonical outcome key
@@ -183,18 +220,21 @@ class ArbitrageFinder:
 
             # Process each market type separately
             for market_key, outcome_odds in markets_odds.items():
+                # FIXED (Issue 1.5): Validate market completeness before processing
+                is_complete, completeness_reason = self.validate_market_completeness(outcome_odds, market_key, sport)
+                if not is_complete:
+                    logger.debug(f"[{sport}] Skipped {market_key} market: {completeness_reason}")
+                    continue
+
                 # Filter to only outcomes with odds available
                 outcome_keys = list(outcome_odds.keys())
 
                 # Handle 2-way markets (combat sports, totals, spreads)
                 if len(outcome_keys) == 2:
-                    # CRITICAL FIX: Reject 2-way for sports that should be 3-way
-                    # Soccer/Hockey with draws MUST be 3-way to avoid draw losses
-                    if config.is_three_way_sport(sport) and market_key == 'h2h':
-                        # This is soccer/hockey h2h but only has 2 outcomes (missing draw)
-                        # Skip this - it's not safe arbitrage (draw would lose both bets)
-                        # Silently skip - will check for 3-way instead
-                        continue
+                    # FIXED (Issue 1.2): Allow 2-way even for 3-way sports
+                    # If draws aren't offered by bookmakers, 2-way is still valid arbitrage
+                    # The validator will determine if it's mathematically sound
+                    # Only log if we have explicit information about why this market is incomplete
 
                     outcome_a_key = outcome_keys[0]
                     outcome_b_key = outcome_keys[1]
@@ -202,10 +242,11 @@ class ArbitrageFinder:
                     outcome_a_list = outcome_odds[outcome_a_key]
                     outcome_b_list = outcome_odds[outcome_b_key]
 
-                    # Generate opportunities for top 5 combinations (expanded from top 3)
-                    # Testing more odds combinations increases chance of finding arbitrage
-                    for i, odds_a_option in enumerate(outcome_a_list[:5]):
-                        for j, odds_b_option in enumerate(outcome_b_list[:5]):
+                    # FIXED (Issue 1.3): Test ALL bookmaker combinations (exhaustive)
+                    # Previously limited to top 5, which missed arbitrage when best odd on one outcome
+                    # didn't pair with best odd on the other outcome
+                    for i, odds_a_option in enumerate(outcome_a_list):
+                        for j, odds_b_option in enumerate(outcome_b_list):
                             processed_matches.append({
                                 'sport': sport,
                                 'market': market_key,
@@ -236,11 +277,11 @@ class ArbitrageFinder:
                         away_list = outcome_odds[away_outcome]
                         draw_list = outcome_odds[draw_outcome]
 
-                        # Generate opportunities for top 5 combinations (expanded from top 3)
-                        # 3-way soccer/hockey: testing more combinations = more arbitrage detection
-                        for i, odds_home in enumerate(home_list[:5]):
-                            for j, odds_draw in enumerate(draw_list[:5]):
-                                for k, odds_away in enumerate(away_list[:5]):
+                        # FIXED (Issue 1.3): Test ALL 3-way combinations (exhaustive)
+                        # Previously limited to top 5, which missed valid arbitrage opportunities
+                        for i, odds_home in enumerate(home_list):
+                            for j, odds_draw in enumerate(draw_list):
+                                for k, odds_away in enumerate(away_list):
                                     processed_matches.append({
                                         'sport': sport,
                                         'market': market_key,
@@ -459,77 +500,55 @@ class ArbitrageFinder:
             profit_margin = calculate_three_way_arbitrage(odds_home, odds_draw, odds_away)
 
             if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
-                # Calculate stakes
-                stakes_result = calculate_stakes_with_validation(
+                # FIXED (Issue 2.3): Use iterative refinement for balanced stakes
+                stake_a, stake_draw, stake_b = calculate_three_way_stakes_balanced(
                     odds_home, odds_draw, odds_away, config.DEFAULT_STAKE
                 )
 
-                if stakes_result:
-                    # For 3-way, we need to handle this differently
-                    # Use calculate_three_way_stakes instead
-                    denominator = (1 / odds_home) + (1 / odds_draw) + (1 / odds_away)
-                    stake_a = config.DEFAULT_STAKE * (1 / odds_home) / denominator
-                    stake_draw = config.DEFAULT_STAKE * (1 / odds_draw) / denominator
-                    stake_b = config.DEFAULT_STAKE * (1 / odds_away) / denominator
+                # Verify arbitrage survives rounding (Issue 2.3)
+                is_valid, guaranteed_profit, min_return, max_return = verify_arbitrage_with_rounding(
+                    odds_home, odds_draw, odds_away,
+                    stake_a, stake_draw, stake_b,
+                    config.DEFAULT_STAKE
+                )
 
-                    # Adjust stakes to ensure exact $100 total and equal returns
-                    total_stake = stake_a + stake_draw + stake_b
-                    if abs(total_stake - config.DEFAULT_STAKE) > 0.01:
-                        # Normalize to exactly $100
-                        ratio = config.DEFAULT_STAKE / total_stake
-                        stake_a *= ratio
-                        stake_draw *= ratio
-                        stake_b *= ratio
-
-                    # Round to cents
-                    stake_a = round(stake_a, 2)
-                    stake_draw = round(stake_draw, 2)
-                    stake_b = round(config.DEFAULT_STAKE - stake_a - stake_draw, 2)
-
-                    # Validate stakes
-                    is_valid, adj_stake_a, adj_stake_draw, adj_stake_b, stake_reason = (
-                        True, stake_a, stake_draw, stake_b, "Stakes balanced"
+                if is_valid:
+                    # Scenario validate the opportunity
+                    is_arb_valid, validation_reason, validation_results = validator.validate_three_way_arbitrage(
+                        outcome_home, outcome_draw, outcome_away,
+                        stake_a, stake_draw, stake_b,
+                        odds_home, odds_draw, odds_away, sport
                     )
 
-                    if is_valid:
-                        # Scenario validate the opportunity
-                        is_arb_valid, validation_reason, validation_results = validator.validate_three_way_arbitrage(
-                            outcome_home, outcome_draw, outcome_away,
-                            adj_stake_a, adj_stake_draw, adj_stake_b,
-                            odds_home, odds_draw, odds_away, sport
-                        )
-
-                        if is_arb_valid:
-                            guaranteed_profit = validation_results['profit_range'][0]
-
-                            cross_market_opps.append({
-                                'sport': sport,
-                                'market': 'h2h_three_way',
-                                'num_outcomes': 3,
-                                'player_a': 'HOME',
-                                'player_draw': 'DRAW',
-                                'player_b': 'AWAY',
-                                'odds_a': odds_home,
-                                'odds_draw': odds_draw,
-                                'odds_b': odds_away,
-                                'bookmaker_a': home_opt['bookmaker'],
-                                'bookmaker_draw': draw_opt['bookmaker'],
-                                'bookmaker_b': away_opt['bookmaker'],
-                                'market_a': home_opt['market'],
-                                'market_draw': draw_opt['market'],
-                                'market_b': away_opt['market'],
-                                'profit_margin': profit_margin,
-                                'stake_a': adj_stake_a,
-                                'stake_draw': adj_stake_draw,
-                                'stake_b': adj_stake_b,
-                                'guaranteed_profit': guaranteed_profit,
-                                'total_stake': config.DEFAULT_STAKE,
-                                'is_cross_market': False,
-                                'is_validated': True,
-                                'commence_time': commence_time,
-                                'event_name': f"{home_team} vs {away_team}",
-                                'validation_notes': validation_reason
-                            })
+                    if is_arb_valid:
+                        cross_market_opps.append({
+                            'sport': sport,
+                            'market': 'h2h_three_way',
+                            'num_outcomes': 3,
+                            'player_a': 'HOME',
+                            'player_draw': 'DRAW',
+                            'player_b': 'AWAY',
+                            'odds_a': odds_home,
+                            'odds_draw': odds_draw,
+                            'odds_b': odds_away,
+                            'bookmaker_a': home_opt['bookmaker'],
+                            'bookmaker_draw': draw_opt['bookmaker'],
+                            'bookmaker_b': away_opt['bookmaker'],
+                            'market_a': home_opt['market'],
+                            'market_draw': draw_opt['market'],
+                            'market_b': away_opt['market'],
+                            'profit_margin': profit_margin,
+                            'stake_a': stake_a,
+                            'stake_draw': stake_draw,
+                            'stake_b': stake_b,
+                            'guaranteed_profit': guaranteed_profit,
+                            'total_stake': config.DEFAULT_STAKE,
+                            'is_cross_market': False,
+                            'is_validated': True,
+                            'commence_time': commence_time,
+                            'event_name': f"{home_team} vs {away_team}",
+                            'validation_notes': validation_reason
+                        })
 
         # Strategy 2: Spread + Moneyline (only valid specific combinations)
         # HOME -X (spread) vs AWAY (moneyline) is INVALID because:
@@ -556,6 +575,11 @@ class ArbitrageFinder:
         stake_validator = StakeValidator()
         partition_validator = OutcomePartition()
 
+        # Track filtering for diagnostics
+        profit_threshold_rejections = 0
+        stake_validation_rejections = 0
+        arbitrage_validation_rejections = 0
+
         for match in matches:
             num_outcomes = match.get('num_outcomes', 2)
 
@@ -576,7 +600,11 @@ class ArbitrageFinder:
                 profit_margin = calculate_arbitrage_profit(odds_a, odds_b)
 
                 # Check if meets minimum threshold
-                if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
+                if profit_margin < config.MINIMUM_PROFIT_THRESHOLD:
+                    profit_threshold_rejections += 1
+                    continue
+
+                if True:  # Profitable match, continue processing
                     # Calculate initial stakes
                     stakes_result = calculate_stakes_with_validation(
                         odds_a, odds_b, config.DEFAULT_STAKE
@@ -695,22 +723,21 @@ class ArbitrageFinder:
 
                 # Check if meets minimum threshold
                 if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
-                    # Calculate initial stakes
-                    denominator = (1 / odds_a) + (1 / odds_draw) + (1 / odds_b)
-                    stake_a_ideal = config.DEFAULT_STAKE * (1 / odds_a) / denominator
-                    stake_draw_ideal = config.DEFAULT_STAKE * (1 / odds_draw) / denominator
-                    stake_b_ideal = config.DEFAULT_STAKE * (1 / odds_b) / denominator
-
-                    stake_a = round(stake_a_ideal, 2)
-                    stake_draw = round(stake_draw_ideal, 2)
-                    stake_b = round(config.DEFAULT_STAKE - stake_a - stake_draw, 2)
-
-                    # FIXED: Validate and adjust stakes for 3-way
-                    is_valid, adj_stake_a, adj_stake_draw, adj_stake_b, stake_reason = stake_validator.validate_three_way_stakes(
-                        odds_a, odds_draw, odds_b, stake_a, stake_draw, stake_b, config.DEFAULT_STAKE
+                    # FIXED (Issue 2.3): Use iterative refinement for balanced stakes
+                    # This ensures returns are equal even after rounding to cents
+                    stake_a, stake_draw, stake_b = calculate_three_way_stakes_balanced(
+                        odds_a, odds_draw, odds_b, config.DEFAULT_STAKE
                     )
 
-                    if not is_valid:
+                    # Verify arbitrage survives rounding (Issue 2.3)
+                    is_stakes_valid, guaranteed_profit, min_return, max_return = verify_arbitrage_with_rounding(
+                        odds_a, odds_draw, odds_b,
+                        stake_a, stake_draw, stake_b,
+                        config.DEFAULT_STAKE
+                    )
+
+                    if not is_stakes_valid:
+                        logger.debug(f"3-way stakes failed verification: returns {min_return:.2f} to {max_return:.2f}")
                         continue
 
                     # Build outcome dicts for validation
@@ -730,25 +757,24 @@ class ArbitrageFinder:
                         'total': None
                     }
 
-                    # FIXED: Scenario validate 3-way opportunity
+                    # Scenario validate 3-way opportunity
                     is_arb_valid, validation_reason, validation_results = validator.validate_three_way_arbitrage(
                         outcome_a, outcome_draw, outcome_b,
-                        adj_stake_a, adj_stake_draw, adj_stake_b,
+                        stake_a, stake_draw, stake_b,
                         odds_a, odds_draw, odds_b, sport
                     )
 
                     if not is_arb_valid:
+                        logger.debug(f"3-way arbitrage validation failed: {validation_reason}")
                         continue
-
-                    guaranteed_profit = validation_results['profit_range'][0]
 
                     # Create opportunity dict
                     opportunity = {
                         **match,
                         'profit_margin': profit_margin,
-                        'stake_a': adj_stake_a,
-                        'stake_draw': adj_stake_draw,
-                        'stake_b': adj_stake_b,
+                        'stake_a': stake_a,
+                        'stake_draw': stake_draw,
+                        'stake_b': stake_b,
                         'guaranteed_profit': guaranteed_profit,
                         'total_stake': config.DEFAULT_STAKE,
                         'is_validated': True,
@@ -759,6 +785,44 @@ class ArbitrageFinder:
 
         return opportunities
     
+    def validate_market_completeness(self, market_outcomes: Dict, market_key: str, sport: str) -> tuple:
+        """
+        Validate that a market has complete outcome coverage.
+
+        Args:
+            market_outcomes: Dict of {outcome_key: [odds, ...]}
+            market_key: Market type ('h2h', 'spreads', 'totals')
+            sport: Sport key
+
+        Returns:
+            Tuple of (is_complete, reason)
+        """
+        outcome_keys = list(market_outcomes.keys())
+        num_outcomes = len(outcome_keys)
+
+        if market_key == 'h2h':
+            # 3-way sports should ideally have 3 outcomes, but 2 is acceptable if draws unavailable
+            if config.is_three_way_sport(sport):
+                if num_outcomes < 2:
+                    return (False, f"h2h market has only {num_outcomes} outcome(s)")
+                # 2-way is acceptable (draw odds not offered)
+                # 3-way is ideal (all outcomes offered)
+            else:
+                # 2-way sports should have 2 outcomes
+                if num_outcomes != 2:
+                    return (False, f"h2h market has {num_outcomes} outcomes, expected 2 for combat sport")
+        elif market_key in ['spreads', 'totals']:
+            # These are inherently 2-way (or binary)
+            if num_outcomes < 2:
+                return (False, f"{market_key} market has only {num_outcomes} outcome(s)")
+
+        # Check that each outcome has at least one odds entry
+        for outcome_key, odds_list in market_outcomes.items():
+            if not odds_list or len(odds_list) == 0:
+                return (False, f"Outcome {outcome_key} has no odds")
+
+        return (True, "Market complete")
+
     def create_alert_key(self, opportunity: Dict) -> str:
         """
         Create a unique key for an opportunity to track duplicates.
@@ -837,7 +901,106 @@ class ArbitrageFinder:
             return (False, f"Stake total ${total_stake:.2f} doesn't equal ${config.DEFAULT_STAKE:.2f}")
 
         return (True, "All filters and validations passed")
-    
+
+    def validate_opportunity_complete(self, opportunity: Dict) -> tuple:
+        """
+        Comprehensive validation covering all failure modes (Issue 2.4, Correction 3.4).
+
+        Performs checks in this order:
+        1. Mathematical validity (with rounding-aware profit checks)
+        2. Execution feasibility (time to event, total stake)
+        3. Market validity (freshness, completeness)
+        4. Bookmaker trust
+
+        Args:
+            opportunity: Opportunity dictionary
+
+        Returns:
+            Tuple of (is_valid: bool, reason: str, checks: dict)
+        """
+        checks = {
+            'mathematical': (None, None),
+            'execution': (None, None),
+            'market': (None, None),
+            'bookmakers': (None, None)
+        }
+
+        # 1. Mathematical validation
+        if opportunity.get('num_outcomes') == 2:
+            # For 2-way, verify stakes and returns
+            odds_a = opportunity['odds_a']
+            odds_b = opportunity['odds_b']
+            stake_a = opportunity['stake_a']
+            stake_b = opportunity['stake_b']
+
+            return_a = stake_a * odds_a
+            return_b = stake_b * odds_b
+            total_stake = stake_a + stake_b
+
+            is_math_valid = (
+                abs(total_stake - config.DEFAULT_STAKE) <= 0.01 and
+                abs(return_a - return_b) <= 0.10  # Allow 10 cent tolerance
+            )
+            math_reason = f"Returns: ${return_a:.2f} vs ${return_b:.2f}, Total stake: ${total_stake:.2f}"
+        else:
+            # For 3-way, use our verification function
+            is_math_valid, guaranteed_profit, min_return, max_return = verify_arbitrage_with_rounding(
+                opportunity['odds_a'],
+                opportunity['odds_draw'],
+                opportunity['odds_b'],
+                opportunity['stake_a'],
+                opportunity['stake_draw'],
+                opportunity['stake_b'],
+                config.DEFAULT_STAKE
+            )
+            math_reason = f"Guaranteed profit: ${guaranteed_profit:.2f}"
+
+        checks['mathematical'] = (is_math_valid, math_reason)
+
+        # 2. Execution validation
+        try:
+            event_time = datetime.fromisoformat(opportunity.get('commence_time', '').replace('Z', '+00:00'))
+            time_to_event = (event_time - datetime.now(event_time.tzinfo)).total_seconds() / 60  # Minutes
+
+            execution_valid = time_to_event > 5  # Need at least 5 minutes
+            exec_reason = f"Time to event: {time_to_event:.1f} minutes"
+        except (ValueError, AttributeError, TypeError):
+            execution_valid = False
+            exec_reason = "Could not parse event time"
+
+        checks['execution'] = (execution_valid, exec_reason)
+
+        # 3. Market validation (freshness if available)
+        market_valid = True
+        market_reason = "Market data fresh"
+
+        # If we have freshness info, check it
+        if '_freshness_seconds' in opportunity:
+            freshness = opportunity['_freshness_seconds']
+            market_valid = freshness < 30
+            market_reason = f"Data age: {freshness:.1f}s"
+
+        checks['market'] = (market_valid, market_reason)
+
+        # 4. Bookmaker validation
+        bookmakers = [opportunity['bookmaker_a'], opportunity['bookmaker_b']]
+        if opportunity.get('num_outcomes') == 3:
+            bookmakers.append(opportunity['bookmaker_draw'])
+
+        bookmaker_valid = all(
+            config.BOOKMAKER_TRUST_SCORES.get(bm, 0) >= config.MINIMUM_BOOKMAKER_TRUST
+            for bm in bookmakers
+        )
+        bookmaker_reason = f"Bookmakers: {', '.join(bookmakers)}"
+
+        checks['bookmakers'] = (bookmaker_valid, bookmaker_reason)
+
+        # Overall decision
+        all_valid = all(check[0] for check in checks.values())
+        reason = "; ".join(f"{k}: {v[1]}" for k, v in checks.items() if v[1])
+
+        return (all_valid, reason, checks)
+
     def should_alert(self, opportunity: Dict) -> bool:
         """
         Check if we should alert for this opportunity (not a recent duplicate).
@@ -1246,14 +1409,50 @@ class ArbitrageFinder:
         # Fetch and process odds for rotated sports only
         for sport in sports_to_check:
             print(f"[{sport}] Fetching odds...")
-            odds_data = self.fetch_odds(sport)
+            api_response = self.fetch_odds(sport)
 
-            if odds_data:
+            if api_response:
+                # Extract odds data from API response (The Odds API returns {"data": [...], "last_update": "...", ...})
+                if isinstance(api_response, dict) and 'data' in api_response:
+                    odds_data = api_response['data']
+                    freshness = api_response.get('_freshness_seconds', None)
+                else:
+                    # Fallback if response format is different
+                    odds_data = api_response if isinstance(api_response, list) else []
+                    freshness = None
+
+                if not odds_data:
+                    logger.warning(f"[{sport}] API response contained no odds data")
+                    continue
+
                 print(f"[{sport}] Found {len(odds_data)} matches")
 
                 # Process odds (single market per match)
                 processed_matches = self.process_odds(odds_data, sport)
                 print(f"[{sport}] Processed {len(processed_matches)} single-market opportunities")
+
+                # Diagnostic: Sample profit margins to understand what we're getting
+                if processed_matches:
+                    sample_profits = []
+                    for i, match in enumerate(processed_matches[:min(100, len(processed_matches))]):
+                        if match.get('num_outcomes') == 2:
+                            profit = calculate_arbitrage_profit(match['odds_a'], match['odds_b'])
+                            sample_profits.append(profit)
+                        elif match.get('num_outcomes') == 3:
+                            profit = calculate_three_way_arbitrage(
+                                match['odds_a'],
+                                match['odds_draw'],
+                                match['odds_b']
+                            )
+                            sample_profits.append(profit)
+
+                    if sample_profits:
+                        max_profit = max(sample_profits)
+                        avg_profit = sum(sample_profits) / len(sample_profits)
+                        profitable = sum(1 for p in sample_profits if p >= config.MINIMUM_PROFIT_THRESHOLD)
+                        logger.debug(f"[{sport}] Sample of {len(sample_profits)} combos: "
+                                   f"max={max_profit:.3f}%, avg={avg_profit:.3f}%, "
+                                   f"profitable={profitable}/{len(sample_profits)}")
 
                 # Find standard arbitrage opportunities
                 opportunities = self.find_arbitrage_opportunities(processed_matches)
@@ -1266,6 +1465,8 @@ class ArbitrageFinder:
                 cross_market_opportunities = []
                 for match_data in odds_data:
                     match_data['sport'] = sport  # Add sport to match data
+                    if freshness is not None:
+                        match_data['_freshness_seconds'] = freshness
                     cross_opps = self.find_cross_market_arbitrage(match_data)
                     cross_market_opportunities.extend(cross_opps)
 

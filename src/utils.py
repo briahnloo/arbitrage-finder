@@ -237,25 +237,156 @@ def calculate_three_way_arbitrage(odds_a: float, odds_draw: float, odds_b: float
 def calculate_three_way_stakes(odds_a: float, odds_draw: float, odds_b: float, total_stake: float) -> tuple:
     """
     Calculate optimal stake distribution for 3-way arbitrage betting.
-    
+
+    DEPRECATED: Use calculate_three_way_stakes_balanced() instead for better rounding behavior.
+
     Args:
         odds_a: Decimal odds for outcome A (home win)
         odds_draw: Decimal odds for draw
         odds_b: Decimal odds for outcome B (away win)
         total_stake: Total amount to invest
-    
+
     Returns:
-        Tuple of (stake_a, stake_draw, stake_b) representing optimal bet amounts
+        Tuple of (stake_a, stake_draw, stake_b) representing optimal bet amounts (unrounded)
     """
     # Calculate the denominator (sum of inverse odds)
     denominator = (1 / odds_a) + (1 / odds_draw) + (1 / odds_b)
-    
+
     # Calculate stakes proportionally
     stake_a = total_stake * (1 / odds_a) / denominator
     stake_draw = total_stake * (1 / odds_draw) / denominator
     stake_b = total_stake * (1 / odds_b) / denominator
-    
+
     return (stake_a, stake_draw, stake_b)
+
+
+def calculate_three_way_stakes_balanced(odds_a: float, odds_draw: float, odds_b: float,
+                                       total_stake: float = 100.0, max_iterations: int = 10) -> tuple:
+    """
+    Calculate 3-way stakes through iterative refinement to ensure returns are balanced.
+
+    This function finds stakes [S_a, S_d, S_b] such that:
+    1. S_a + S_d + S_b = total_stake (exactly, within cents)
+    2. S_a * odds_a ≈ S_d * odds_draw ≈ S_b * odds_b (within tolerance)
+    3. All values are valid money amounts (rounded to cents)
+
+    The key difference from naive proportional allocation: this iteratively refines
+    stakes to preserve return balance even after rounding to cents.
+
+    Args:
+        odds_a: Decimal odds for outcome A (home win)
+        odds_draw: Decimal odds for draw
+        odds_b: Decimal odds for outcome B (away win)
+        total_stake: Total amount to invest (default $100)
+        max_iterations: Maximum iterations for refinement (default 10)
+
+    Returns:
+        Tuple of (stake_a, stake_draw, stake_b) with exact total and balanced returns
+    """
+    # Start with theoretical optimal (unrounded)
+    denominator = (1 / odds_a) + (1 / odds_draw) + (1 / odds_b)
+    stake_a = total_stake * (1 / odds_a) / denominator
+    stake_draw = total_stake * (1 / odds_draw) / denominator
+    stake_b = total_stake * (1 / odds_b) / denominator
+
+    # Iteratively refine by rounding and rebalancing
+    for iteration in range(max_iterations):
+        # Refine: scale stakes inversely to their returns
+        # If an outcome has higher return than average, reduce its stake
+        return_a = stake_a * odds_a
+        return_draw = stake_draw * odds_draw
+        return_b = stake_b * odds_b
+
+        avg_return = (return_a + return_draw + return_b) / 3
+
+        if return_a > avg_return + 0.005:  # Small epsilon to avoid oscillation
+            scale_a = avg_return / return_a if return_a > 0 else 1.0
+            stake_a *= scale_a
+        if return_draw > avg_return + 0.005:
+            scale_d = avg_return / return_draw if return_draw > 0 else 1.0
+            stake_draw *= scale_d
+        if return_b > avg_return + 0.005:
+            scale_b = avg_return / return_b if return_b > 0 else 1.0
+            stake_b *= scale_b
+
+        # Re-normalize to total_stake
+        current_total = stake_a + stake_draw + stake_b
+        if current_total > 0:
+            ratio = total_stake / current_total
+            stake_a *= ratio
+            stake_draw *= ratio
+            stake_b *= ratio
+
+        # NOW round to nearest cent (after normalization)
+        stake_a = round(stake_a, 2)
+        stake_draw = round(stake_draw, 2)
+        stake_b = round(total_stake - stake_a - stake_draw, 2)  # Ensure exact total
+
+        # Calculate returns for rounded stakes
+        return_a = stake_a * odds_a
+        return_draw = stake_draw * odds_draw
+        return_b = stake_b * odds_b
+
+        # Check if balanced (all returns within 1 cent tolerance)
+        max_return = max(return_a, return_draw, return_b)
+        min_return = min(return_a, return_draw, return_b)
+        return_diff = max_return - min_return
+
+        if return_diff < 0.01:  # Within 1 cent, we're done
+            break
+
+    return (stake_a, stake_draw, stake_b)
+
+
+def verify_arbitrage_with_rounding(odds_a: float, odds_draw: float, odds_b: float,
+                                  stake_a: float, stake_draw: float, stake_b: float,
+                                  total_stake: float = 100.0) -> tuple:
+    """
+    Verify that arbitrage survives rounding and actual stake execution.
+
+    Checks:
+    1. Stakes sum to exactly total_stake (within 1 cent)
+    2. Returns are balanced (within 5 cent tolerance)
+    3. Calculates guaranteed profit based on actual returns
+
+    Args:
+        odds_a: Odds for outcome A
+        odds_draw: Odds for draw
+        odds_b: Odds for outcome B
+        stake_a: Actual stake for A (should be rounded)
+        stake_draw: Actual stake for draw (should be rounded)
+        stake_b: Actual stake for B (should be rounded)
+        total_stake: Expected total stake
+
+    Returns:
+        Tuple of (is_valid, guaranteed_profit, min_return, max_return)
+        - is_valid: True if arbitrage survives rounding
+        - guaranteed_profit: Minimum guaranteed profit (or loss if negative)
+        - min_return: Minimum return across outcomes
+        - max_return: Maximum return across outcomes
+    """
+    # Calculate returns
+    return_a = stake_a * odds_a
+    return_draw = stake_draw * odds_draw
+    return_b = stake_b * odds_b
+
+    # Check stake total
+    actual_total = stake_a + stake_draw + stake_b
+    if abs(actual_total - total_stake) > 0.01:
+        return (False, 0, 0, 0)  # Invalid: stakes don't sum correctly
+
+    # Check returns are balanced
+    min_return = min(return_a, return_draw, return_b)
+    max_return = max(return_a, return_draw, return_b)
+    return_diff = max_return - min_return
+
+    if return_diff > 0.05:  # More than 5 cents difference
+        return (False, 0, min_return, max_return)
+
+    # Arbitrage is valid
+    guaranteed_profit = min_return - total_stake
+
+    return (True, guaranteed_profit, min_return, max_return)
 
 
 def calculate_three_way_profit(odds_a: float, odds_draw: float, odds_b: float, 
