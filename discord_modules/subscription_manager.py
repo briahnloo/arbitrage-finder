@@ -95,6 +95,17 @@ class SubscriptionManager:
                 )
             ''')
 
+            # Premium entitlements table (one-time purchase, lifetime access)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS premium_entitlements (
+                    discord_id INTEGER PRIMARY KEY,
+                    purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    lifetime BOOLEAN DEFAULT 1,
+                    is_active BOOLEAN DEFAULT 1,
+                    FOREIGN KEY (discord_id) REFERENCES users(discord_id)
+                )
+            ''')
+
             conn.commit()
             logger.info('Database initialized successfully')
 
@@ -466,3 +477,116 @@ class SubscriptionManager:
             return 0
         finally:
             conn.close()
+
+    async def is_premium_user(self, discord_id: int) -> bool:
+        """
+        Check if user has active lifetime premium
+
+        Args:
+            discord_id: Discord user ID
+
+        Returns:
+            True if user has lifetime premium, False otherwise
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                'SELECT is_active FROM premium_entitlements WHERE discord_id = ? AND lifetime = 1',
+                (discord_id,)
+            )
+            result = cursor.fetchone()
+            conn.close()
+
+            return result is not None and result[0]
+
+        except sqlite3.Error as e:
+            logger.error(f'Error checking premium status: {e}')
+            return False
+
+    async def grant_lifetime_premium(self, discord_id: int) -> bool:
+        """
+        Grant lifetime premium access to user
+
+        Args:
+            discord_id: Discord user ID
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # First ensure user exists
+            await self.create_user(discord_id, f"User_{discord_id}")
+
+            # Insert or update premium entitlement
+            cursor.execute('''
+                INSERT OR REPLACE INTO premium_entitlements
+                (discord_id, lifetime, is_active)
+                VALUES (?, 1, 1)
+            ''', (discord_id,))
+
+            conn.commit()
+            logger.info(f'Granted lifetime premium to user {discord_id}')
+            return True
+
+        except sqlite3.Error as e:
+            logger.error(f'Error granting premium: {e}')
+            return False
+        finally:
+            conn.close()
+
+    async def revoke_premium(self, discord_id: int) -> bool:
+        """
+        Revoke premium access from user
+
+        Args:
+            discord_id: Discord user ID
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                'UPDATE premium_entitlements SET is_active = 0 WHERE discord_id = ?',
+                (discord_id,)
+            )
+
+            conn.commit()
+            logger.info(f'Revoked premium for user {discord_id}')
+            return True
+
+        except sqlite3.Error as e:
+            logger.error(f'Error revoking premium: {e}')
+            return False
+        finally:
+            conn.close()
+
+    async def get_all_premium_users(self) -> List[int]:
+        """
+        Get list of all active premium users
+
+        Returns:
+            List of discord_ids with active lifetime premium
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                'SELECT discord_id FROM premium_entitlements WHERE is_active = 1 AND lifetime = 1'
+            )
+            results = cursor.fetchall()
+            conn.close()
+
+            return [row[0] for row in results]
+
+        except sqlite3.Error as e:
+            logger.error(f'Error fetching premium users: {e}')
+            return []

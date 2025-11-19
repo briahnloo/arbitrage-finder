@@ -3,7 +3,23 @@ Discord Notifier for Arbitrage Finder
 Sends formatted embed messages for arbitrage opportunities to Discord channels
 """
 
-import discord
+import sys
+from pathlib import Path
+import importlib.util
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Get discord.py from site-packages, bypassing local discord/ directory
+spec = importlib.util.find_spec('discord', package=None)
+if spec and spec.origin and 'site-packages' in spec.origin:
+    import importlib
+    discord = importlib.import_module('discord')
+    sys.modules['discord'] = discord
+else:
+    # Fallback
+    import discord
+    sys.modules['discord'] = discord
+
 import logging
 from typing import Dict, Optional, List
 from datetime import datetime

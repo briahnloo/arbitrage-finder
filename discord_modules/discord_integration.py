@@ -3,16 +3,39 @@ Discord Integration Module for Arbitrage Finder
 Connects the Discord bot with the arbitrage finder to send real-time alerts
 """
 
+import sys
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import discord.py from sys.modules (should be set by discord_bot.py)
+# If not available, import it ourselves
+if 'discord' not in sys.modules or not hasattr(sys.modules['discord'], 'ext'):
+    # Remove local discord from path temporarily
+    local_discord_dir = str(Path(__file__).parent)
+    sys.path = [p for p in sys.path if p != local_discord_dir]
+
+    try:
+        import discord as discord_py
+        from discord.ext import commands, tasks
+        sys.modules['discord'] = discord_py
+    finally:
+        sys.path.insert(0, local_discord_dir)
+else:
+    discord_py = sys.modules['discord']
+    from discord.ext import commands, tasks
+
+discord = discord_py
+
 import asyncio
 import logging
 from typing import Optional, Dict, List
 from datetime import datetime
-import discord
-from discord.ext import commands, tasks
 
-from discord.discord_notifier import DiscordNotifier
-from discord.subscription_manager import SubscriptionManager
-from discord.user_manager import UserManager
+from .discord_notifier import DiscordNotifier
+from .subscription_manager import SubscriptionManager
+from .user_manager import UserManager
 from src.arbitrage_finder import ArbitrageFinder
 
 logger = logging.getLogger(__name__)
@@ -49,36 +72,99 @@ class DiscordIntegrationManager:
 
     async def send_opportunity_to_subscribers(self, opportunity: Dict, is_high_priority: bool = False):
         """
-        Send opportunity alert to subscribers
-
-        Args:
-            opportunity: Arbitrage opportunity dictionary
-            is_high_priority: Whether to send to premium channel immediately
+        Send opportunity alert to subscribers based on premium status.
+        Routes premium users to premium channel, free users to preview channel.
+        ENHANCED: Comprehensive logging at each step for full visibility.
         """
+        event_name = opportunity.get('event_name', 'unknown')
+        logger.info(f'[DISCORD] 📤 Attempting to send alert: {event_name}')
+
+        # STEP 1: Ensure guild is initialized
+        # BUGFIX: If guild wasn't available at startup, try to initialize it now
+        if not self.guild and self.bot.guilds:
+            guild = self.bot.guilds[0]
+            await self.initialize(guild)
+            logger.info(f'[DISCORD] ✓ Deferred guild initialization: {guild.name} (ID: {guild.id})')
+
+        # STEP 2: Validate guild exists before proceeding
         if not self.guild:
-            logger.warning('Guild not initialized')
+            logger.error(f'[DISCORD] ❌ CRITICAL: Guild not initialized - cannot send "{event_name}"')
+            logger.error(f'[DISCORD] Bot must be invited to a Discord server. Check that bot is in your server.')
             return
 
+        logger.debug(f'[DISCORD] ✓ Guild ready: {self.guild.name}')
+
         try:
-            # Get alert channel
-            alerts_channel_id = int(opportunity.get('alerts_channel_id', 0))
-            premium_channel_id = int(opportunity.get('premium_alerts_channel_id', 0))
+            # STEP 3: Get channel IDs from config
+            from src.config import (
+                DISCORD_PREMIUM_ALERTS_CHANNEL_ID,
+                DISCORD_FREE_PREVIEW_CHANNEL_ID
+            )
 
-            alerts_channel = self.bot.get_channel(alerts_channel_id)
-            premium_channel = self.bot.get_channel(premium_channel_id) if is_high_priority else None
+            # STEP 4: Fetch channels from Discord
+            premium_channel = self.bot.get_channel(DISCORD_PREMIUM_ALERTS_CHANNEL_ID)
+            free_channel = self.bot.get_channel(DISCORD_FREE_PREVIEW_CHANNEL_ID)
 
-            # Send to public alerts channel
-            if alerts_channel:
-                await self.notifier.send_opportunity_alert(alerts_channel, opportunity, is_premium=False)
-                logger.info(f'Sent alert to public channel: {opportunity.get("event_name")}')
+            # STEP 5: Validate channels exist (detailed logging)
+            if premium_channel:
+                logger.debug(f'[DISCORD] ✓ Premium channel found: {premium_channel.name} (ID: {DISCORD_PREMIUM_ALERTS_CHANNEL_ID})')
+            else:
+                logger.error(f'[DISCORD] ❌ Premium channel NOT FOUND (ID: {DISCORD_PREMIUM_ALERTS_CHANNEL_ID})')
+                logger.error(f'[DISCORD] Check: channel ID correct? Bot has permission to see channel?')
 
-            # Send to premium channel if high priority
-            if is_high_priority and premium_channel:
-                await self.notifier.send_opportunity_alert(premium_channel, opportunity, is_premium=True)
-                logger.info(f'Sent premium alert: {opportunity.get("event_name")}')
+            if free_channel:
+                logger.debug(f'[DISCORD] ✓ Free preview channel found: {free_channel.name} (ID: {DISCORD_FREE_PREVIEW_CHANNEL_ID})')
+            else:
+                logger.error(f'[DISCORD] ❌ Free preview channel NOT FOUND (ID: {DISCORD_FREE_PREVIEW_CHANNEL_ID})')
+                logger.error(f'[DISCORD] Check: channel ID correct? Bot has permission to see channel?')
 
-            # Send to individual premium subscribers
-            await self._send_to_premium_subscribers(opportunity)
+            # STEP 6: Get premium users for routing decision
+            premium_users = await self.subscription_manager.get_all_premium_users()
+            logger.debug(f'[DISCORD] Premium users in database: {len(premium_users)}')
+
+            # STEP 7: Send to premium channel (if exists and has subscribers)
+            premium_send_ok = False
+            if premium_channel and premium_users:
+                try:
+                    await self.notifier.send_opportunity_alert(
+                        premium_channel,
+                        opportunity,
+                        is_premium=True
+                    )
+                    logger.info(f'[DISCORD] ✓✓ Premium channel sent: "{event_name}"')
+                    premium_send_ok = True
+                except Exception as e:
+                    logger.error(f'[DISCORD] ❌ Premium channel send failed: {e}')
+                    import traceback
+                    logger.error(f'[DISCORD] Traceback:\n{traceback.format_exc()}')
+            elif premium_channel and not premium_users:
+                logger.info(f'[DISCORD] ℹ️  Premium channel skipped: no premium users yet for "{event_name}"')
+            elif not premium_channel:
+                logger.warning(f'[DISCORD] ⚠️  Premium channel unavailable - skipping')
+
+            # STEP 8: Always send to free preview channel (sample for all users)
+            free_send_ok = False
+            if free_channel:
+                try:
+                    await self.notifier.send_opportunity_alert(
+                        free_channel,
+                        opportunity,
+                        is_premium=False
+                    )
+                    logger.info(f'[DISCORD] ✓✓ Free preview channel sent: "{event_name}"')
+                    free_send_ok = True
+                except Exception as e:
+                    logger.error(f'[DISCORD] ❌ Free channel send failed: {e}')
+                    import traceback
+                    logger.error(f'[DISCORD] Traceback:\n{traceback.format_exc()}')
+            else:
+                logger.error(f'[DISCORD] ❌ Free preview channel unavailable - alert NOT sent')
+
+            # STEP 9: Final status
+            if free_send_ok or premium_send_ok:
+                logger.info(f'[DISCORD] ✓✓✓ Alert completed for: "{event_name}"')
+            else:
+                logger.error(f'[DISCORD] ❌ Alert FAILED: no channels available or all sends failed')
 
             # Add to daily summary
             self.daily_summary['total_found'] += 1

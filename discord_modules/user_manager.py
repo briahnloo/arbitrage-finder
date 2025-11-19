@@ -3,11 +3,28 @@ User Manager for Arbitrage Finder Discord Bot
 Handles user profiles, roles, and access control
 """
 
-import discord
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import discord.py (should be available from sys.modules)
+if 'discord' not in sys.modules or not hasattr(sys.modules['discord'], 'ext'):
+    local_discord_dir = str(Path(__file__).parent)
+    sys.path = [p for p in sys.path if p != local_discord_dir]
+    try:
+        import discord as discord_py
+        sys.modules['discord'] = discord_py
+    finally:
+        sys.path.insert(0, local_discord_dir)
+else:
+    discord_py = sys.modules['discord']
+
+discord = discord_py
+
 import logging
 from typing import Optional, Dict, List
 from datetime import datetime
-from subscription_manager import SubscriptionManager, SubscriptionStatus
+from .subscription_manager import SubscriptionManager, SubscriptionStatus
 
 logger = logging.getLogger(__name__)
 

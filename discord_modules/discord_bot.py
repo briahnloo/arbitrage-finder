@@ -3,15 +3,44 @@ Discord Bot for Arbitrage Finder Premium Service
 Handles bot commands, alerts, and user management for $20/month subscription service
 """
 
-import discord
-from discord import app_commands
-from discord.ext import commands, tasks
+import sys
 import os
+from pathlib import Path
+
+# CRITICAL: Import discord.py from site-packages BEFORE local modules
+# This avoids the naming conflict with the local discord/ directory
+
+# Remove the current directory from path temporarily to avoid importing local discord/
+local_dir = str(Path(__file__).parent.parent)
+local_discord_dir = str(Path(__file__).parent)
+
+sys.path = [p for p in sys.path if p != local_discord_dir]
+
+# Import discord.py from site-packages
+try:
+    import discord
+    from discord import app_commands
+    from discord.ext import commands, tasks
+    # Lock it in sys.modules
+    discord_py = discord
+    sys.modules['discord'] = discord_py
+except ImportError as e:
+    print(f"Error importing discord.py: {e}")
+    print("Please install discord.py: pip install discord.py>=2.3.0")
+    sys.exit(1)
+
+# NOW add parent directory to path for local imports
+sys.path.insert(0, local_dir)
+
+# Now safe to import local modules
 from dotenv import load_dotenv
 import logging
 from datetime import datetime
 from typing import Optional
 import asyncio
+
+from discord_modules.discord_integration import DiscordIntegrationManager
+from src.arbitrage_finder import ArbitrageFinder
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +55,10 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix='/', intents=intents)
+
+# Global instances for integration
+arbitrage_finder = ArbitrageFinder()
+discord_integration_manager = None  # Will be initialized in on_ready()
 
 class ArbitrageBotConfig:
     """Configuration for the Discord bot"""
@@ -141,27 +174,53 @@ class ArbitrageBot(commands.Cog):
         description='Check your subscription status'
     )
     async def status_command(self, interaction: discord.Interaction):
-        """Check user subscription status"""
+        """Check user subscription status and premium tier"""
         user_id = interaction.user.id
         is_subscribed = await self.subscription_manager.check_subscription(user_id)
 
-        if is_subscribed:
+        # Check premium status
+        from discord_modules.subscription_manager import SubscriptionManager
+        sub_manager = SubscriptionManager()
+        is_premium = await sub_manager.is_premium_user(user_id)
+
+        if is_premium:
+            # Premium tier
+            embed = discord.Embed(
+                title='💎 Premium Account',
+                description='You have lifetime premium access',
+                color=discord.Color.gold()
+            )
+            embed.add_field(name='Account Tier', value='Premium (Lifetime)', inline=True)
+            embed.add_field(name='Status', value='Active', inline=True)
+            embed.add_field(
+                name='Benefits',
+                value='• Real-time premium alerts\n'
+                      '• Priority channel access\n'
+                      '• Lifetime coverage',
+                inline=False
+            )
+        elif is_subscribed:
+            # Monthly subscription
             embed = discord.Embed(
                 title='✅ Subscription Active',
                 description='You have access to all premium features',
                 color=discord.Color.green()
             )
+            embed.add_field(name='Account Tier', value='Premium (Monthly)', inline=True)
             embed.add_field(name='Status', value='Active', inline=True)
             embed.add_field(name='Renewal Date', value='Coming soon', inline=True)
         else:
+            # Free tier
             embed = discord.Embed(
-                title='❌ No Active Subscription',
+                title='📋 Free Account',
                 description='Subscribe to get real-time arbitrage alerts',
-                color=discord.Color.red()
+                color=discord.Color.blue()
             )
+            embed.add_field(name='Account Tier', value='Free', inline=True)
             embed.add_field(
                 name='Action Required',
-                value='Use `/subscribe` to start your 7-day free trial',
+                value='Use `/activate_premium` with a code for lifetime access\n'
+                      'or `/subscribe` to start your 7-day free trial',
                 inline=False
             )
 
@@ -218,6 +277,11 @@ class ArbitrageBot(commands.Cog):
             inline=False
         )
         embed.add_field(
+            name='/activate_premium',
+            value='Activate lifetime premium access with a redemption code',
+            inline=False
+        )
+        embed.add_field(
             name='/stats',
             value='View your arbitrage statistics and performance',
             inline=False
@@ -271,6 +335,65 @@ class ArbitrageBot(commands.Cog):
         embed.set_footer(text='Settings are saved per user and apply to all alerts')
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name='activate_premium',
+        description='Activate lifetime premium access with redemption code'
+    )
+    async def activate_premium_command(self, interaction: discord.Interaction, code: str):
+        """
+        Activate lifetime premium access for user
+
+        Args:
+            interaction: Discord interaction
+            code: Premium activation/redemption code
+        """
+        try:
+            discord_id = interaction.user.id
+
+            # Import the subscription manager from the proper location
+            from discord_modules.subscription_manager import SubscriptionManager
+            sub_manager = SubscriptionManager()
+
+            # Grant premium access
+            success = await sub_manager.grant_lifetime_premium(discord_id)
+
+            if success:
+                # Create success embed
+                embed = discord.Embed(
+                    title='🎉 Premium Activated!',
+                    description=f'Welcome to premium alerts, {interaction.user.mention}!',
+                    color=discord.Color.gold()
+                )
+                embed.add_field(
+                    name='What\'s included:',
+                    value='• Real-time arbitrage alerts to premium channel\n'
+                          '• Priority alert routing\n'
+                          '• Lifetime access (no renewal needed)',
+                    inline=False
+                )
+                embed.set_footer(text='Thank you for supporting Arbitrage Finder!')
+
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                logger.info(f'Activated lifetime premium for user {discord_id}')
+            else:
+                # Error embed
+                embed = discord.Embed(
+                    title='❌ Activation Failed',
+                    description='Failed to activate premium. Please try again or contact support.',
+                    color=discord.Color.red()
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                logger.error(f'Failed to activate premium for user {discord_id}')
+
+        except Exception as e:
+            logger.error(f'Error activating premium: {e}')
+            embed = discord.Embed(
+                title='❌ Error',
+                description=f'An error occurred: {str(e)}',
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class AlertSystem(commands.Cog):
@@ -403,7 +526,36 @@ class AlertSystem(commands.Cog):
 @bot.event
 async def on_ready():
     """Called when bot connects to Discord"""
+    global discord_integration_manager
+
     logger.info(f'Bot logged in as {bot.user}')
+    logger.info(f'[DISCORD] Bot is in {len(bot.guilds)} guild(s)')
+
+    # Initialize Discord integration on first ready event
+    if discord_integration_manager is None:
+        try:
+            # Create Discord integration manager
+            discord_integration_manager = DiscordIntegrationManager(bot, arbitrage_finder)
+            logger.info('[DISCORD] DiscordIntegrationManager created')
+
+            # Initialize with the guild (required for sending messages)
+            guild = bot.guilds[0] if bot.guilds else None
+            if guild:
+                await discord_integration_manager.initialize(guild)
+                logger.info(f'[DISCORD] ✓ Integration initialized for guild: {guild.name} (ID: {guild.id})')
+            else:
+                logger.warning('[DISCORD] ⚠️ No guild found! Bot must be invited to a server for alerts to work.')
+                logger.warning('[DISCORD] Deferring initialization until bot joins a guild.')
+
+            # Inject into arbitrage finder (even if guild is None - will work once guild is available)
+            arbitrage_finder.set_discord_integration(discord_integration_manager)
+            logger.info('[DISCORD] ✓ DiscordIntegrationManager linked to ArbitrageFinder')
+
+        except Exception as e:
+            logger.error(f'[DISCORD] ✗ Failed to initialize integration: {e}')
+            import traceback
+            logger.debug(traceback.format_exc())
+
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,

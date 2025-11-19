@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import sys
 import logging
+import asyncio
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -53,7 +54,8 @@ class ArbitrageFinder:
         self.api_call_count = 0
         self.last_api_call_time = None
         self.cycle_number = 0  # Track iteration cycles
-        
+        self._logged_2way_sports = set()  # Track which sports we've logged 2-way allowed for (per cycle)
+
         # Initialize database if enabled
         self.db = None
         if config.ENABLE_DATABASE_LOGGING:
@@ -63,7 +65,144 @@ class ArbitrageFinder:
             except Exception as e:
                 print(f"[DATABASE ERROR] Could not initialize database: {e}")
                 self.db = None
-        
+
+        # Initialize Discord integration if available
+        self.discord_integration = None
+        try:
+            from discord_modules.discord_integration import DiscordIntegrationManager
+            # Note: This will be set by the main bot when it initializes
+            # For now, it's None until the Discord bot starts
+        except ImportError:
+            pass  # Discord module not available, alerts will still work via console
+
+    def set_discord_integration(self, discord_integration):
+        """
+        Set the Discord integration manager (called by the bot when it initializes).
+        Sends a test notification to verify the entire system works end-to-end.
+
+        Args:
+            discord_integration: DiscordIntegrationManager instance
+        """
+        self.discord_integration = discord_integration
+        logger.info("[DISCORD] ✓ Integration linked to ArbitrageFinder")
+        logger.info(f"[DISCORD]   Integration manager: {discord_integration}")
+        logger.info(f"[DISCORD]   Bot: {discord_integration.bot if discord_integration else 'N/A'}")
+        logger.info(f"[DISCORD]   Guild: {discord_integration.guild if discord_integration else 'N/A'}")
+
+        # Send test notification to verify entire pipeline works
+        try:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                logger.error("[DISCORD] ❌ No event loop available for test notification")
+                loop = None
+
+            if loop is None:
+                logger.error("[DISCORD] ❌ Cannot send test notification - no event loop")
+                return
+
+            if loop.is_running():
+                logger.info("[DISCORD] 🧪 Test notification scheduled (async)...")
+                task = asyncio.create_task(self._send_test_notification())
+                # Add callback to catch async failures
+                task.add_done_callback(self._test_notification_callback)
+            else:
+                logger.info("[DISCORD] 🧪 Test notification running (synchronous)...")
+                loop.run_until_complete(self._send_test_notification())
+                logger.info("[DISCORD] ✓ Test notification completed")
+        except Exception as e:
+            logger.error(f"[DISCORD] ❌ Test notification failed: {e}")
+            import traceback
+            logger.error(f"[DISCORD] Traceback:\n{traceback.format_exc()}")
+
+    def _test_notification_callback(self, task):
+        """Callback to check if async test notification succeeded"""
+        if task.exception():
+            logger.error(f"[DISCORD] ❌ Async test notification failed: {task.exception()}")
+            import traceback
+            logger.error(f"[DISCORD] Traceback: {traceback.format_exception(type(task.exception()), task.exception(), task.exception().__traceback__)}")
+        else:
+            logger.info("[DISCORD] ✓ Async test notification completed successfully")
+
+    async def _send_test_notification(self):
+        """Send a test notification to both premium and free channels."""
+        if not self.discord_integration:
+            return
+
+        try:
+            from src.config import (
+                DISCORD_PREMIUM_ALERTS_CHANNEL_ID,
+                DISCORD_FREE_PREVIEW_CHANNEL_ID
+            )
+
+            # Create test opportunity
+            test_opp = {
+                'event_name': '🧪 System Test',
+                'sport': 'test',
+                'market_key': 'h2h',
+                'bookmaker_1': 'Arbitrage Finder',
+                'bookmaker_2': 'Test System',
+                'odds_a': 0,
+                'odds_b': 0,
+                'profit_margin': 0,
+                'guaranteed_profit': 0,
+                'confidence_label': 'TEST'
+            }
+
+            # Send to both channels
+            premium_channel = self.discord_integration.bot.get_channel(DISCORD_PREMIUM_ALERTS_CHANNEL_ID)
+            free_channel = self.discord_integration.bot.get_channel(DISCORD_FREE_PREVIEW_CHANNEL_ID)
+
+            if premium_channel:
+                await self.discord_integration.notifier.send_opportunity_alert(
+                    premium_channel,
+                    test_opp,
+                    is_premium=True
+                )
+                logger.info(f"[DISCORD] ✓ Test notification sent to premium channel")
+
+            if free_channel:
+                await self.discord_integration.notifier.send_opportunity_alert(
+                    free_channel,
+                    test_opp,
+                    is_premium=False
+                )
+                logger.info(f"[DISCORD] ✓ Test notification sent to free preview channel")
+
+        except Exception as e:
+            logger.debug(f"Test notification failed: {e}")
+
+    def validate_implied_probability(self, odds_list: List[float], match_id: str = "") -> bool:
+        """
+        PHASE 1: Validate that implied probabilities are reasonable.
+        Catches obvious misprices or stale data where probabilities are extreme.
+        (Returns False only for very suspicious odds > 1.15; silently accepts 1.10-1.15)
+
+        Args:
+            odds_list: List of decimal odds to validate
+            match_id: Optional match identifier for logging
+
+        Returns:
+            True if probabilities are valid, False if extremely suspicious (>1.15)
+        """
+        if not config.ENABLE_PROBABILITY_VALIDATION:
+            return True  # Feature disabled in config
+
+        try:
+            # Calculate implied probability sum
+            implied_prob_sum = sum(1.0 / odds for odds in odds_list if odds > 0)
+
+            # Only reject if VERY suspicious (>1.15, indicating serious data issue)
+            if implied_prob_sum > config.MAXIMUM_IMPLIED_PROBABILITY:
+                logger.debug(f"[PHASE1] Rejected suspicious odds sum={implied_prob_sum:.4f}: {match_id}")
+                return False
+
+            # Silent pass for 1.10-1.15 range (normal market noise)
+            return True
+
+        except (ValueError, ZeroDivisionError):
+            return False  # Silently reject on calculation error
+
     def fetch_odds(self, sport: str) -> Optional[Dict]:
         """
         Fetch odds data from The Odds API for a specific sport.
@@ -242,6 +381,10 @@ class ArbitrageFinder:
                     outcome_a_list = outcome_odds[outcome_a_key]
                     outcome_b_list = outcome_odds[outcome_b_key]
 
+                    # PHASE 1: Check if this is a 3-way sport where draw odds could exist
+                    # has_draw = True if DRAW is available in the market, False otherwise
+                    has_draw = 'DRAW' in outcome_keys if config.is_three_way_sport(sport) and market_key == 'h2h' else False
+
                     # FIXED (Issue 1.3): Test ALL bookmaker combinations (exhaustive)
                     # Previously limited to top 5, which missed arbitrage when best odd on one outcome
                     # didn't pair with best odd on the other outcome
@@ -262,7 +405,8 @@ class ArbitrageFinder:
                                 'odds_rank_a': i,  # 0=best, 1=2nd, 2=3rd
                                 'odds_rank_b': j,
                                 'commence_time': commence_time,
-                                'event_name': f"{home_team} vs {away_team}"
+                                'event_name': f"{home_team} vs {away_team}",
+                                'has_draw': has_draw  # PHASE 1: Flag if draw odds exist in market
                             })
 
                 # Handle 3-way markets (soccer/hockey h2h with draw)
@@ -590,10 +734,28 @@ class ArbitrageFinder:
                 sport = match.get('sport', 'Unknown')
                 market = match.get('market', 'h2h')
 
-                # SAFETY CHECK: Never show 2-way for sports with draws (soccer/hockey)
-                # 2-way soccer is NOT risk-free (draw loses both bets)
+                # PHASE 1 ENHANCEMENT: Allow 2-way soccer/hockey only if draw odds are unavailable
+                # If draw odds don't exist in the market, 2-way IS a complete partition
+                skip_2way_for_3way_sport = False
+
                 if config.is_three_way_sport(sport) and market == 'h2h':
-                    # Silently skip - not safe for sports where draws are possible
+                    # Check if draw odds exist in this match
+                    has_draw_odds = match.get('has_draw', False)  # Set during odds processing
+
+                    if has_draw_odds:
+                        # Draw odds available - 2-way is not safe (draw loses both bets)
+                        skip_2way_for_3way_sport = True
+                    elif not config.ALLOW_2WAY_SOCCER_HOCKEY_NO_DRAWS:
+                        # Config disables 2-way for soccer/hockey even if draws unavailable
+                        skip_2way_for_3way_sport = True
+                    else:
+                        # No draw odds available AND feature is enabled - allow 2-way
+                        # Log only once per sport per cycle (not once per match!)
+                        if sport not in self._logged_2way_sports:
+                            logger.debug(f"[PHASE1] Allowing 2-way H2H for {sport} (no draw odds found)")
+                            self._logged_2way_sports.add(sport)
+
+                if skip_2way_for_3way_sport:
                     continue
 
                 # Calculate profit margin
@@ -602,6 +764,11 @@ class ArbitrageFinder:
                 # Check if meets minimum threshold
                 if profit_margin < config.MINIMUM_PROFIT_THRESHOLD:
                     profit_threshold_rejections += 1
+                    continue
+
+                # PHASE 1: Validate implied probabilities (sanity check for stale/mispriced odds)
+                if not self.validate_implied_probability([odds_a, odds_b], match.get('event_name', '')):
+                    logger.debug(f"[PHASE1] Skipped {match.get('event_name', 'unknown')}: failed probability validation")
                     continue
 
                 if True:  # Profitable match, continue processing
@@ -720,6 +887,11 @@ class ArbitrageFinder:
 
                 # Calculate profit margin
                 profit_margin = calculate_three_way_arbitrage(odds_a, odds_draw, odds_b)
+
+                # PHASE 1: Validate implied probabilities (sanity check for stale/mispriced odds)
+                if not self.validate_implied_probability([odds_a, odds_draw, odds_b], match.get('event_name', '')):
+                    logger.debug(f"[PHASE1] Skipped 3-way {match.get('event_name', 'unknown')}: failed probability validation")
+                    continue
 
                 # Check if meets minimum threshold
                 if profit_margin >= config.MINIMUM_PROFIT_THRESHOLD:
@@ -1392,6 +1564,7 @@ class ArbitrageFinder:
         - Reduces API credits from 1,728/day to 144/day
         """
         self.cycle_number += 1
+        self._logged_2way_sports.clear()  # Reset per-cycle tracking for 2-way sports logging
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"\n{'=' * 100}")
         print(f"[{current_time}] Cycle #{self.cycle_number} - Checking for arbitrage opportunities...")
@@ -1508,6 +1681,53 @@ class ArbitrageFinder:
                 # Display individual alert if enabled
                 if config.SHOW_INDIVIDUAL_ALERTS:
                     self.display_alert(opp)
+
+                # Send to Discord if integration available
+                event_name = opp.get('event_name', 'unknown')
+
+                if self.discord_integration:
+                    try:
+                        logger.info(f"[DISCORD] 📬 Sending opportunity to Discord: {event_name}")
+
+                        # Safely get event loop
+                        try:
+                            loop = asyncio.get_event_loop()
+                        except RuntimeError as e:
+                            logger.error(f"[DISCORD] ❌ No event loop available: {e}")
+                            loop = None
+
+                        if loop is None:
+                            logger.error(f"[DISCORD] ❌ Cannot send alert - no event loop available for: {event_name}")
+                        elif loop.is_running():
+                            # Event loop is running (e.g., in bot context)
+                            logger.debug(f"[DISCORD] Event loop running - scheduling async task for: {event_name}")
+                            task = asyncio.create_task(
+                                self.discord_integration.send_opportunity_to_subscribers(opp)
+                            )
+                            # Attach callback to monitor async task completion
+                            def make_callback(event):
+                                def callback(t):
+                                    if t.exception():
+                                        logger.error(f"[DISCORD] ❌ Async send failed for '{event}': {t.exception()}")
+                                    else:
+                                        logger.info(f"[DISCORD] ✓ Async send completed for '{event}'")
+                                return callback
+                            task.add_done_callback(make_callback(event_name))
+                        else:
+                            # No event loop running - run synchronously (likely from main.py)
+                            logger.debug(f"[DISCORD] Event loop not running - running synchronously for: {event_name}")
+                            loop.run_until_complete(
+                                self.discord_integration.send_opportunity_to_subscribers(opp)
+                            )
+                            logger.info(f"[DISCORD] ✓ Synchronous send completed for: {event_name}")
+
+                    except Exception as e:
+                        logger.error(f"[DISCORD] ❌ Exception sending alert for '{event_name}': {type(e).__name__}: {e}")
+                        import traceback
+                        logger.error(f"[DISCORD] Full traceback:\n{traceback.format_exc()}")
+                else:
+                    logger.warning(f"[DISCORD] ⚠️  Discord integration NOT available - alert cannot be sent")
+                    logger.warning(f"[DISCORD] Troubleshooting: Check that Discord bot is running and connected")
 
                 # Log alert to database
                 if self.db and opportunity_id:
